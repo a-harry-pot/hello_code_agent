@@ -1,4 +1,4 @@
-""""HelloAgents统一LLM接口 - 基于OpenAI原生API"""
+"""HelloAgents统一LLM接口 - 基于OpenAI原生API"""
 
 import os
 from typing import Literal, Optional, Iterator
@@ -25,54 +25,52 @@ class HelloAgentsLLM:
     """
 
     def __init__(
-            self,
-            model:Optional[str]=None,
-            api_key:Optional[str]=None,
-            base_url:Optional[str]=None,
-            provider:Optional[SUPPORTED_PROVIDERS]=None,
-            temperature:float=0.7,
-            max_tokens:Optional[int]=None,
-            timeout:Optional[int]=None,
-            **kwargs
+        self,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        provider: Optional[SUPPORTED_PROVIDERS] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[int] = None,
+        **kwargs
     ):
         """
-        初始化客户端，优先使用传入参数，如果未提供，则从环境变量加载
-        支持自动检测provider或使用统一的LLM_*环境变量配置
+        初始化客户端。优先使用传入参数，如果未提供，则从环境变量加载。
+        支持自动检测provider或使用统一的LLM_*环境变量配置。
 
-
-        :param model: 模型名称，若未提供则从环境变量LLM_MODEL_ID读取
-        :param api_key: API密钥
-        :param base_url: 服务地址
-        :param provider: LLM提供商，若未提供自动检测
-        :param temperature: 温度参数
-        :param max_tokens: 最大token数
-        :param timeout: 超时时间
-        :param kwargs:
+        Args:
+            model: 模型名称，如果未提供则从环境变量LLM_MODEL_ID读取
+            api_key: API密钥，如果未提供则从环境变量读取
+            base_url: 服务地址，如果未提供则从环境变量LLM_BASE_URL读取
+            provider: LLM提供商，如果未提供则自动检测
+            temperature: 温度参数
+            max_tokens: 最大token数
+            timeout: 超时时间，从环境变量LLM_TIMEOUT读取，默认60秒
         """
+        # 优先使用传入参数，如果未提供，则从环境变量加载
+        self.model = model or os.getenv("LLM_MODEL_ID")
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+        self.kwargs = kwargs
 
-        #优先使用传入参数，如果未提供，则从环境变量加载
-        self.model=model or os.getenv("LLM_MODEL_ID")
-        self.temperature=temperature
-        self.max_tokens=max_tokens
-        self.timeout=timeout or int(os.environ.get("LLM_TIMEOUT", 60))
-        self.kwargs=kwargs
+        # 自动检测provider或使用指定的provider
+        self.provider = provider or self._auto_detect_provider(api_key, base_url)
 
-        # 自动检测provider或者使用指定的provider
-        self.provider=provider or self._auto_detect_provider(api_key,base_url)
+        # 根据provider确定API密钥和base_url
+        self.api_key, self.base_url = self._resolve_credentials(api_key, base_url)
 
-        #根据provider确定API密钥和base_url
-        self.api_key,self.base_url=self._resolve_credentials(api_key,base_url)
-
-        #验证必要参数
+        # 验证必要参数
         if not self.model:
-            self.model=self._get_default_model()
-        if not all([self.api_key,self.base_url]):
+            self.model = self._get_default_model()
+        if not all([self.api_key, self.base_url]):
             raise HelloAgentsException("API密钥和服务地址必须被提供或在.env文件中定义。")
 
         # 创建OpenAI客户端
-        self._client=self._create_client()
+        self._client = self._create_client()
 
-    def _auto_detect_provider(self,api_key:Optional[str],base_url:Optional[str])->str:
+    def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
         """
         自动检测LLM提供商
 
@@ -211,7 +209,7 @@ class HelloAgentsLLM:
             resolved_base_url = base_url or os.getenv("LLM_BASE_URL")
             return resolved_api_key, resolved_base_url
 
-    def _create_client(self)->OpenAI:
+    def _create_client(self) -> OpenAI:
         """创建OpenAI客户端"""
         return OpenAI(
             api_key=self.api_key,
@@ -219,7 +217,7 @@ class HelloAgentsLLM:
             timeout=self.timeout
         )
 
-    def _get_default_model(self) ->str:
+    def _get_default_model(self) -> str:
         """获取默认模型"""
         if self.provider == "openai":
             return "gpt-3.5-turbo"
@@ -262,19 +260,21 @@ class HelloAgentsLLM:
             else:
                 return "gpt-3.5-turbo"
 
-    def think(self,messages:list[dict[str,str]],temperature:Optional[float]=None) -> Iterator[str]:
+    def think(self, messages: list[dict[str, str]], temperature: Optional[float] = None) -> Iterator[str]:
         """
-        调用大语言模型进行思考，并返回流式响应
-        这是主要的调用方法，默认使用流式响应以获得更好的用户体验
+        调用大语言模型进行思考，并返回流式响应。
+        这是主要的调用方法，默认使用流式响应以获得更好的用户体验。
 
-        :param messages: 消息列表
-        :param temperature: 温度参数，如果未提供则使用初始化的值
-        :yields: 流式响应的文本片段
+        Args:
+            messages: 消息列表
+            temperature: 温度参数，如果未提供则使用初始化时的值
+
+        Yields:
+            str: 流式响应的文本片段
         """
-
         print(f"🧠 正在调用 {self.model} 模型...")
         try:
-            response=self._client.chat.completions.create(
+            response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 temperature=temperature if temperature is not None else self.temperature,
@@ -285,71 +285,31 @@ class HelloAgentsLLM:
             # 处理流式响应
             print("✅ 大语言模型响应成功:")
             for chunk in response:
-                content=chunk.choices[0].delta.content or ""
+                content = chunk.choices[0].delta.content or ""
                 if content:
-                    print(content,end="",flush=True)
+                    print(content, end="", flush=True)
                     yield content
-            print() #在流式输出后换行
+            print()  # 在流式输出结束后换行
 
         except Exception as e:
             print(f"❌ 调用LLM API时发生错误: {e}")
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
-    def invoke(self,messages:list[dict[str,str]],**kwargs) -> str:
+    def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
         """
-        非流式调用llm，返回完整响应
-        适用于不需要流式输出的场景
-
+        非流式调用LLM，返回完整响应。
+        适用于不需要流式输出的场景。
         """
-        try:
-            response=self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=kwargs.get("temperature",self.temperature),
-                max_tokens=kwargs.get("max_tokens",self.max_tokens),
-                **{k: v for k,v in kwargs.items() if k not in ["temperature","max_tokens"]}
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            raise HelloAgentsException(f"LLM调用失败: {str(e)}")
-
-    def invoke_with_metadata(self, messages: list[dict[str, str]], **kwargs) -> tuple[str, dict]:
-        """
-        非流式调用 LLM，返回 (响应文本, 元数据字典)。
-
-        元数据包含:
-            - latency_ms: 调用耗时（毫秒）
-            - prompt_tokens: 输入 token 数
-            - completion_tokens: 输出 token 数
-            - model: 实际使用的模型名
-        """
-        import time as _time
-        t0 = _time.perf_counter()
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=kwargs.get("temperature", self.temperature),
-                max_tokens=kwargs.get("max_tokens", self.max_tokens),
-                **{k: v for k, v in kwargs.items() if k not in ["temperature", "max_tokens"]},
+                temperature=kwargs.get('temperature', self.temperature),
+                max_tokens=kwargs.get('max_tokens', self.max_tokens),
+                **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
             )
-            elapsed = (_time.perf_counter() - t0) * 1000
-            usage = response.usage
-            metadata = {
-                "latency_ms": round(elapsed, 1),
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-                "model": self.model,
-            }
-            return response.choices[0].message.content, metadata
+            return response.choices[0].message.content
         except Exception as e:
-            elapsed = (_time.perf_counter() - t0) * 1000
-            metadata = {
-                "latency_ms": round(elapsed, 1),
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "model": self.model,
-            }
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> Iterator[str]:
@@ -359,4 +319,3 @@ class HelloAgentsLLM:
         """
         temperature = kwargs.get('temperature')
         yield from self.think(messages, temperature)
-

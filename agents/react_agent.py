@@ -1,13 +1,11 @@
 """ReAct Agent实现 - 推理与行动结合的智能体"""
 
 import re
-import time as _time
 from typing import Optional, List, Tuple, Callable, Dict, Any
 from core.agent import Agent
 from core.llm import HelloAgentsLLM
 from core.config import Config
 from core.message import Message
-from core.tracer import TraceStore, StepRecord, LLMCallRecord
 from tools.registry import ToolRegistry
 from utils.cli_ui import Spinner, c, PRIMARY, ACCENT, INFO, hr, log_tool_event, clamp_text
 
@@ -95,7 +93,6 @@ class ReActAgent(Agent):
         self.finalize_on_max_steps = finalize_on_max_steps
         self.early_stop_on_repeat = early_stop_on_repeat
         self.repeat_action_threshold = repeat_action_threshold
-        self.trace_store: Optional[TraceStore] = None
 
         # 设置提示词模板：用户自定义优先，否则使用默认模板
         self.prompt_template = custom_prompt if custom_prompt else DEFAULT_REACT_PROMPT
@@ -174,7 +171,7 @@ class ReActAgent(Agent):
             messages = [{"role": "user", "content": prompt}]
             spinner = Spinner("Thinking…")
             spinner.start()
-            response_text, llm_meta = self.llm.invoke_with_metadata(messages, **kwargs)
+            response_text = self.llm.invoke(messages, **kwargs)
             spinner.stop()
 
             if not response_text:
@@ -232,10 +229,8 @@ class ReActAgent(Agent):
 
             log_tool_event(tool_name, tool_input)
 
-            # 调用工具（计时）
-            t0 = _time.perf_counter()
+            # 调用工具
             observation = self.tool_registry.execute_tool(tool_name, tool_input)
-            tool_latency_ms = (_time.perf_counter() - t0) * 1000
             observation_full = observation
             observation_summary = None
             if (

@@ -54,10 +54,6 @@ class Config(BaseModel):
         description="允许修改的文件后缀"
     )
 
-    # ==================== 追踪配置 ====================
-    trace_enabled: bool = Field(default=True, description="启用 Agent 思考链路追踪")
-    trace_dir: str = Field(default="traces", description="追踪数据目录（相对于 helloagents_dir）")
-
     # ==================== 存储配置 ====================
     helloagents_dir: str = Field(default=".helloagents", description="状态存储目录")
 
@@ -78,8 +74,7 @@ class Config(BaseModel):
             **overrides: 手动覆盖的配置项
         """
         env_config = {
-            "debug": os.getenv("DEBUG", "false").lower() == "true" or os.getenv("CODE_AGENT_DEBUG",
-                                                                                "false").lower() == "true",
+            "debug": os.getenv("DEBUG", "false").lower() == "true" or os.getenv("CODE_AGENT_DEBUG", "false").lower() == "true",
             "log_level": os.getenv("LOG_LEVEL", "INFO"),
             "temperature": float(os.getenv("TEMPERATURE", "0.7")),
             "helloagents_dir": os.getenv("HELLOAGENTS_DIR", os.getenv("CODE_AGENT_STATE_DIR", ".helloagents")),
@@ -93,19 +88,19 @@ class Config(BaseModel):
         if os.getenv("MAX_TOKENS"):
             env_config["max_tokens"] = int(os.getenv("MAX_TOKENS"))
 
-        # 合并覆盖配置项
+        # 合并覆盖配置
         env_config.update(overrides)
 
         return cls(**env_config)
 
-    def get_state_dir(self,repo_root:Path)->Path:
+    def get_state_dir(self, repo_root: Path) -> Path:
         """获取状态存储目录的绝对路径"""
-        state_path=Path(self.helloagents_dir)
+        state_path = Path(self.helloagents_dir)
         if state_path.is_absolute():
             return state_path
         return repo_root / state_path
 
-    def get_notes_dir(self,repo_root:Path)->Path:
+    def get_notes_dir(self, repo_root: Path) -> Path:
         """获取笔记目录"""
         return self.get_state_dir(repo_root) / "notes"
 
@@ -120,10 +115,6 @@ class Config(BaseModel):
     def get_todos_dir(self, repo_root: Path) -> Path:
         """获取待办目录"""
         return self.get_state_dir(repo_root) / "todos"
-
-    def get_traces_dir(self, repo_root: Path) -> Path:
-        """获取追踪数据目录"""
-        return self.get_state_dir(repo_root) / self.trace_dir
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
