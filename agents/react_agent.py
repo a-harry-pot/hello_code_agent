@@ -6,6 +6,7 @@ from core.agent import Agent
 from core.llm import HelloAgentsLLM
 from core.config import Config
 from core.message import Message
+from core.session_logger import SessionLogger
 from tools.registry import ToolRegistry
 from utils.cli_ui import Spinner, c, PRIMARY, ACCENT, INFO, hr, log_tool_event, clamp_text
 
@@ -64,6 +65,7 @@ class ReActAgent(Agent):
         finalize_on_max_steps: bool = True,
         early_stop_on_repeat: bool = True,
         repeat_action_threshold: int = 2,
+        session_logger: Optional[SessionLogger] = None,
     ):
         """
         初始化ReActAgent
@@ -76,8 +78,9 @@ class ReActAgent(Agent):
             config: 配置对象
             max_steps: 最大执行步数
             custom_prompt: 自定义提示词模板
+            session_logger: 会话日志记录器（可选）
         """
-        super().__init__(name, llm, system_prompt, config)
+        super().__init__(name, llm, system_prompt, config, session_logger=session_logger)
 
         # 如果没有提供tool_registry，创建一个空的
         if tool_registry is None:
@@ -122,7 +125,7 @@ class ReActAgent(Agent):
                         })
                     )
                     self.tool_registry.register_tool(wrapped_tool)
-                print(f"✅ MCP工具 '{tool.name}' 已展开为 {len(tool._available_tools)} 个独立工具")
+                self._log.console(f"✅ MCP工具 '{tool.name}' 已展开为 {len(tool._available_tools)} 个独立工具")
             else:
                 self.tool_registry.register_tool(tool)
         else:
@@ -139,24 +142,34 @@ class ReActAgent(Agent):
         Returns:
             最终答案
         """
+        import time
+        t_start = time.time()
+
         self.current_history = []
         self.last_trace = []
         current_step = 0
+
+        # 日志：用户输入
+        self._log.event("user_input", {
+            "content": input_text,
+            "content_length": len(input_text),
+        })
 
         # Avoid dumping huge stitched prompts to console (CLI UX)
         preview = input_text.replace("\n", " ")
         if len(preview) > 160:
             preview = preview[:160] + "..."
-        print("\n" + hr("=", 80))
-        print(c(f"🤖 {self.name}", PRIMARY) + " " + c(f"{preview}", INFO))
-        print(hr("=", 80))
+        self._log.console("\n" + hr("=", 80))
+        self._log.console(c(f"🤖 {self.name}", PRIMARY) + " " + c(f"{preview}", INFO))
+        self._log.console(hr("=", 80))
 
         repeat_count = 0
         last_action_sig: Optional[str] = None
 
         while current_step < self.max_steps:
             current_step += 1
-            print(c(f"\n--- Step {current_step}/{self.max_steps} ---", ACCENT))
+            self._log.inc_step()
+            self._log.console(c(f"\n--- Step {current_step}/{self.max_steps} ---", ACCENT))
 
             # 构建提示词
             tools_desc = self.tool_registry.get_tools_description()
@@ -175,17 +188,28 @@ class ReActAgent(Agent):
             spinner.stop()
 
             if not response_text:
-                print("❌ 错误：LLM未能返回有效响应。")
+                self._log.console("❌ 错误：LLM未能返回有效响应。")
+                self._log.event("error", {
+                    "context": "agent",
+                    "step": current_step,
+                    "error_type": "EmptyResponse",
+                    "error_message": "LLM未能返回有效响应",
+                })
+                self._log.inc_error()
                 break
 
             # 解析输出
             thought, action = self._parse_output(response_text)
 
             if thought:
-                print(c("Thought:", INFO), thought)
+                self._log.console(c("Thought:", INFO), thought)
+                self._log.event("agent_thought", {
+                    "step": current_step,
+                    "thought": thought,
+                })
 
             if not action:
-                # One forced retry: ask model to rewrite in strict format (helps for greetings / bilingual models)
+                # One forced retry: ask model to rewrite in strict format
                 try:
                     repair_sys = (
                         "You MUST output exactly two lines:\n"
@@ -206,19 +230,34 @@ class ReActAgent(Agent):
                     pass
 
                 if not action:
-                    print(f"⚠️ 警告：未能解析出有效的Action，流程终止。 response_text:{response_text}")
+                    self._log.console(f"⚠️ 警告：未能解析出有效的Action，流程终止。 response_text:{response_text}")
+                    self._log.event("error", {
+                        "context": "parse",
+                        "step": current_step,
+                        "error_type": "ParseError",
+                        "error_message": "未能解析出有效的Action",
+                        "raw_response": response_text[:500] if response_text else "",
+                    })
+                    self._log.inc_error()
                     break
 
             # 检查是否完成
             if action.startswith("Finish"):
                 final_answer = self._parse_action_input(action)
-                print(c("Finish:", PRIMARY))
-                print(final_answer)
+                self._log.console(c("Finish:", PRIMARY))
+                self._log.console(final_answer)
+
+                self._log.event("agent_answer", {
+                    "answer": final_answer,
+                    "total_steps": current_step,
+                    "total_duration_ms": int((time.time() - t_start) * 1000),
+                })
 
                 # 保存到历史记录
                 self.add_message(Message(input_text, "user"))
                 self.add_message(Message(final_answer, "assistant"))
 
+                self._log.close(final_answer=final_answer)
                 return final_answer
 
             # 执行工具调用
@@ -227,6 +266,12 @@ class ReActAgent(Agent):
                 self.current_history.append("Observation: 无效的Action格式，请检查。")
                 continue
 
+            self._log.event("agent_action", {
+                "step": current_step,
+                "action": action,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+            })
             log_tool_event(tool_name, tool_input)
 
             # 调用工具
@@ -243,10 +288,14 @@ class ReActAgent(Agent):
                     if observation_summary and isinstance(observation_summary, str):
                         observation = observation_summary.strip() + "\n...truncated...\n"
                 except Exception:
-                    # fall back to raw observation
                     pass
 
             log_tool_event(f"{tool_name} result", clamp_text(str(observation), limit=6000))
+            self._log.event("agent_observation", {
+                "step": current_step,
+                "observation": str(observation)[:4000],
+                "observation_length": len(str(observation_full)),
+            })
 
             # 提前终止：重复相同 action 且无明显进展
             action_sig = f"{tool_name}|{tool_input}".strip()
@@ -293,19 +342,32 @@ class ReActAgent(Agent):
                 ]
                 final_answer = self.llm.invoke(messages, max_tokens=600)
                 if final_answer:
+                    self._log.event("agent_answer", {
+                        "answer": final_answer,
+                        "total_steps": current_step,
+                        "total_duration_ms": int((time.time() - t_start) * 1000),
+                    })
                     self.add_message(Message(input_text, "user"))
                     self.add_message(Message(final_answer, "assistant"))
+                    self._log.close(final_answer=final_answer)
                     return final_answer
             except Exception:
                 pass
 
-        print("⏰ 已达到最大步数，流程终止。")
+        self._log.console("⏰ 已达到最大步数，流程终止。")
         final_answer = "抱歉，我无法在限定步数内完成这个任务。你可以缩小范围或指定目标文件/模块。"
+
+        self._log.event("agent_answer", {
+            "answer": final_answer,
+            "total_steps": current_step,
+            "total_duration_ms": int((time.time() - t_start) * 1000),
+        })
 
         # 保存到历史记录
         self.add_message(Message(input_text, "user"))
         self.add_message(Message(final_answer, "assistant"))
 
+        self._log.close(final_answer=final_answer)
         return final_answer
 
     def _parse_output(self, text: str) -> Tuple[Optional[str], Optional[str]]:
@@ -316,7 +378,6 @@ class ReActAgent(Agent):
         - 中文标签：思考/行动
         - Markdown 强调：**Thought:** / **Action:**
         """
-        # Normalize to make regex easier
         t = (text or "").strip()
 
         # Primary: strict 2-line format, allow markdown markers and fullwidth colon
@@ -337,7 +398,6 @@ class ReActAgent(Agent):
         action_raw = action_match.group(2).strip() if action_match else None
 
         # 关键修复：如果 action 中包含另一个 Thought/Action/Observation，截断到该位置
-        # 防止模型一次输出多个 Thought/Action 循环时，把后续内容都当作第一个 Action 的输入
         if action_raw:
             stop_patterns = [
                 r"\nThought:", r"\n思考:", r"\nAction:", r"\n行动:",
@@ -396,7 +456,6 @@ class ReActAgent(Agent):
             return tool_name, tool_input
 
         # fallback: 如果括号不匹配，尝试简单正则（不跨行）
-        # 注意：不使用 re.DOTALL，这样 . 不会匹配换行符
         match = re.match(r"(\w+)\[([^\n]*)\]", action_text)
         if match:
             return match.group(1), match.group(2)

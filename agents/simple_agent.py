@@ -7,6 +7,7 @@ from core.agent import Agent
 from core.llm import HelloAgentsLLM
 from core.config import Config
 from core.message import Message
+from core.session_logger import SessionLogger
 
 if TYPE_CHECKING:
     from tools.registry import ToolRegistry
@@ -17,14 +18,15 @@ class SimpleAgent(Agent):
 
     def __init__(
             self,
-            name:str,
-            llm:HelloAgentsLLM,
-            system_prompt:Optional[str]=None,
-            config:Optional[Config]=None,
-            tool_registry:Optional['ToolRegistry']=None,
-            enable_tool_calling:bool=True,
-            tool_confirm_callback:Optional[Callable[[str,dict],bool]]=None,
-            ):
+            name: str,
+            llm: HelloAgentsLLM,
+            system_prompt: Optional[str] = None,
+            config: Optional[Config] = None,
+            tool_registry: Optional['ToolRegistry'] = None,
+            enable_tool_calling: bool = True,
+            tool_confirm_callback: Optional[Callable[[str, dict], bool]] = None,
+            session_logger: Optional[SessionLogger] = None,
+    ):
         """
         初始化SimpleAgent
 
@@ -35,21 +37,22 @@ class SimpleAgent(Agent):
         :param tool_registry:
         :param enable_tool_calling: 工具注册表（可选，如果提供则启用工具调用）
         :param tool_confirm_callback: 是否启用工具调用（只有在提供tool_registry时生效
+        :param session_logger: 会话日志记录器（可选）
         """
-        super().__init__(name,llm,system_prompt,config)
+        super().__init__(name, llm, system_prompt, config, session_logger=session_logger)
         self.tool_registry = tool_registry
         self.enable_tool_calling = enable_tool_calling and tool_registry is not None
         self.tool_confirm_callback = tool_confirm_callback
 
     def _get_enhanced_system_prompt(self) -> str:
         """构建增强的系统提示词，包含工具信息"""
-        base_prompt=self.system_prompt or "你是一个有用的AI助手。"
+        base_prompt = self.system_prompt or "你是一个有用的AI助手。"
 
         if not self.enable_tool_calling or not self.tool_registry:
             return base_prompt
 
         # 获取工具描述
-        tools_description =self.tool_registry.get_tool_description(base_prompt)
+        tools_description = self.tool_registry.get_tool_description(base_prompt)
         if not tools_description or tools_description == "暂无可用工具":
             return base_prompt
 
@@ -76,96 +79,96 @@ class SimpleAgent(Agent):
         tools_section += "- 文件路径等字符串参数直接写：`path=README.md`\n"
         tools_section += "- 工具调用结果会自动插入到对话中，然后你可以基于结果继续回答\n"
 
-        return base_prompt+tools_section
+        return base_prompt + tools_section
 
-    def _parse_tool_calls(self,text:str)->list:
+    def _parse_tool_calls(self, text: str) -> list:
         """解析文本中的工具调用"""
         pattern = r'\[TOOL_CALL:([^:]+):([^\]]+)\]'
         matches = re.findall(pattern, text)
 
         tool_calls = []
-        for tool_name,parameters in matches:
+        for tool_name, parameters in matches:
             tool_calls.append({
-                'tool_name':tool_name.strip(),
-                'parameters':parameters.strip(),
-                'original':f'[TOOL_CALL:{tool_name}:{parameters}]',
+                'tool_name': tool_name.strip(),
+                'parameters': parameters.strip(),
+                'original': f'[TOOL_CALL:{tool_name}:{parameters}]',
             })
 
         return tool_calls
 
-    def _execute_tool_call(self,tool_name:str,parameters:str)->str:
+    def _execute_tool_call(self, tool_name: str, parameters: str) -> str:
         """执行工具调用"""
         if not self.tool_registry:
             return f"❌ 错误：未配置工具注册表"
 
         try:
-            #获取Tool对象
-            tool=self.tool_registry.get_tool(tool_name)
+            # 获取Tool对象
+            tool = self.tool_registry.get_tool(tool_name)
             if not tool:
                 return f"❌ 错误：未找到工具 '{tool_name}'"
 
             # 智能参数解析
-            param_dict=self._parse_tool_parameters(tool_name,parameters)
+            param_dict = self._parse_tool_parameters(tool_name, parameters)
 
             # 交互式确认（由上层执行器确认是否允许执行）
             if self.tool_confirm_callback is not None:
                 try:
-                    allowed=bool(self.tool_confirm_callback(tool_name,param_dict))
+                    allowed = bool(self.tool_confirm_callback(tool_name, param_dict))
                 except Exception as e:
                     return f"❌ 工具调用确认失败：{str(e)}"
                 if not allowed:
                     return "⛔️ 已取消本次工具调用（需要用户确认）。"
 
-            #调用工具
-            result=tool.run(param_dict)
+            # 调用工具
+            result = tool.run(param_dict)
             return f"🔧 工具 {tool_name} 执行结果：\n{result}"
 
         except Exception as e:
             return f"❌ 工具调用失败：{str(e)}"
 
-    def _parse_tool_parameters(self,tool_name:str,parameters:str)->dict:
+    def _parse_tool_parameters(self, tool_name: str, parameters: str) -> dict:
         """智能解析工具参数"""
         import json
-        param_dict={}
+        param_dict = {}
 
-        #尝试解析json格式
+        # 尝试解析json格式
         if parameters.strip().startswith("{"):
             try:
-                param_dict=json.loads(parameters)
-                #json 解析成果，进行类型转换
-                param_dict=self._convert_parameter_types(tool_name,param_dict)
+                param_dict = json.loads(parameters)
+                # json 解析成果，进行类型转换
+                param_dict = self._convert_parameter_types(tool_name, param_dict)
                 return param_dict
             except json.JSONDecodeError:
-                #json解析失败，继续使用其他方式
+                # json解析失败，继续使用其他方式
                 pass
 
         if '=' in parameters:
-            #格式：key=value或者action=search,query=Python
+            # 格式：key=value或者action=search,query=Python
             if ',' in parameters:
-                #多个参数，action=search,query=Python,limit=4
-                pairs=parameters.split(',')
+                # 多个参数，action=search,query=Python,limit=4
+                pairs = parameters.split(',')
                 for pair in pairs:
                     if '=' in pair:
-                        key,value=pair.split('=',1)
-                        param_dict[key.strip()]=value.strip()
+                        key, value = pair.split('=', 1)
+                        param_dict[key.strip()] = value.strip()
             else:
                 # 单个参数，key=value
-                key,value=parameters.split('=',1)
-                param_dict[key.strip()]=value.strip()
+                key, value = parameters.split('=', 1)
+                param_dict[key.strip()] = value.strip()
 
-            #类型转换
-            param_dict=self._convert_parameter_types(tool_name,param_dict)
+            # 类型转换
+            param_dict = self._convert_parameter_types(tool_name, param_dict)
 
             # 智能推断action（如果没有指定）
             if 'action' not in param_dict:
-                param_dict=self._infer_action(tool_name,param_dict)
+                param_dict = self._infer_action(tool_name, param_dict)
         else:
             # 直接传入参数，根据工具类型智能推断
-            param_dict=self._infer_simple_parameters(tool_name,parameters)
+            param_dict = self._infer_simple_parameters(tool_name, parameters)
 
         return param_dict
 
-    def _convert_parameter_types(self,tool_name:str,param_dict:dict)->dict:
+    def _convert_parameter_types(self, tool_name: str, param_dict: dict) -> dict:
         """
         根据工具的参数定义转换参数类型
 
@@ -175,50 +178,50 @@ class SimpleAgent(Agent):
         """
         if not self.tool_registry:
             return param_dict
-        
-        tool=self.tool_registry.get_tool(tool_name)
+
+        tool = self.tool_registry.get_tool(tool_name)
         if not tool:
             return param_dict
-        
-        #获取工具的参数定义
+
+        # 获取工具的参数定义
         try:
-            tool_params=tool.get_parameters()
+            tool_params = tool.get_parameters()
         except:
             return param_dict
-        
-        #创建参数类型映射
-        param_types={}
-        for param in tool_params:
-            param_types[param.name]=param.type
 
-        #转换参数类型
-        converted_dict={}
-        for key,value in param_dict.items():
+        # 创建参数类型映射
+        param_types = {}
+        for param in tool_params:
+            param_types[param.name] = param.type
+
+        # 转换参数类型
+        converted_dict = {}
+        for key, value in param_dict.items():
             if key in param_types:
-                param_type=param_types[key]
+                param_type = param_types[key]
                 try:
-                    if param_type=='number' or param_type=='integer':
-                        #转换为数字
-                        if isinstance(value,str):
-                            converted_dict[key]=float(value) if param_type=='number' else int(value)
+                    if param_type == 'number' or param_type == 'integer':
+                        # 转换为数字
+                        if isinstance(value, str):
+                            converted_dict[key] = float(value) if param_type == 'number' else int(value)
                         else:
-                            converted_dict[key]=value
-                    elif param_type=='boolean':
-                        #转换为布尔值
-                        if isinstance(value,str):
-                            converted_dict[key]=value.lower() in ('true','1','yes')
+                            converted_dict[key] = value
+                    elif param_type == 'boolean':
+                        # 转换为布尔值
+                        if isinstance(value, str):
+                            converted_dict[key] = value.lower() in ('true', '1', 'yes')
                         else:
-                            converted_dict[key]=bool(value)
+                            converted_dict[key] = bool(value)
                     else:
-                        converted_dict[key]=value
-                except (ValueError,TypeError):
-                    #转换失败，保持原值
-                    converted_dict[key]=value
+                        converted_dict[key] = value
+                except (ValueError, TypeError):
+                    # 转换失败，保持原值
+                    converted_dict[key] = value
             else:
-                converted_dict[key]=value
+                converted_dict[key] = value
         return converted_dict
 
-    def _infer_action(self,tool_name:str,param_dict:dict)->dict:
+    def _infer_action(self, tool_name: str, param_dict: dict) -> dict:
         """根据工具类型和参数推断action"""
         if tool_name == 'memory':
             if 'recall' in param_dict:
@@ -242,16 +245,16 @@ class SimpleAgent(Agent):
 
         return param_dict
 
-    def _infer_simple_parameters(self,tool_name:str,parameters:str)->dict:
+    def _infer_simple_parameters(self, tool_name: str, parameters: str) -> dict:
         """为简单参数推断完整的参数字典"""
         if tool_name == 'rag':
-            return {'action':'search','query':parameters}
+            return {'action': 'search', 'query': parameters}
         elif tool_name == 'memory':
-            return {'action':'search','query':parameters}
+            return {'action': 'search', 'query': parameters}
         else:
-            return {'input':parameters}
+            return {'input': parameters}
 
-    def run(self,input_text:str,max_tool_iterations:int=3,**kwargs)->str:
+    def run(self, input_text: str, max_tool_iterations: int = 3, **kwargs) -> str:
         """
         运行SimpleAgent，支持可选的工具调用
 
@@ -260,46 +263,60 @@ class SimpleAgent(Agent):
         :param kwargs: 其他参数
         :return: Agent响应
         """
+        import time
+        t_start = time.time()
+
+        self._log.event("user_input", {
+            "content": input_text,
+            "content_length": len(input_text),
+        })
+
         # 构建消息列表
-        messages=[]
+        messages = []
 
         # 添加系统消息（可能包含工具信息）
-        enhanced_system_prompt=self._get_enhanced_system_prompt()
+        enhanced_system_prompt = self._get_enhanced_system_prompt()
         messages.append({"role": "system", "content": enhanced_system_prompt})
 
         # 添加历史消息
         for msg in self._history:
-            messages.append({"role":msg.role, "content": msg.content})
+            messages.append({"role": msg.role, "content": msg.content})
 
         messages.append({"role": "user", "content": input_text})
 
         # 如果没有启用工具调用，使用原有逻辑
         if not self.enable_tool_calling:
-            response=self.llm.invoke(messages,**kwargs)
-            self.add_message(Message(input_text,"user"))
-            self.add_messgae(Message(response,"assistant"))
+            response = self.llm.invoke(messages, **kwargs)
+            self.add_message(Message(input_text, "user"))
+            self.add_message(Message(response, "assistant"))
+
+            self._log.event("agent_answer", {
+                "answer": response,
+                "total_duration_ms": int((time.time() - t_start) * 1000),
+            })
+            self._log.close(final_answer=response)
             return response
 
         # 迭代处理，支持多轮工具调用
-        current_iteration=0
-        final_response=""
+        current_iteration = 0
+        final_response = ""
 
-        while current_iteration<max_tool_iterations:
-            response=self.llm.invoke(messages,**kwargs)
+        while current_iteration < max_tool_iterations:
+            response = self.llm.invoke(messages, **kwargs)
 
-            #检查是否有工具调用
-            tool_calls=self._parse_tool_calls(response)
+            # 检查是否有工具调用
+            tool_calls = self._parse_tool_calls(response)
 
             if tool_calls:
                 # 执行所有工具调用并收集结果
-                tool_results=[]
-                clean_response=response
+                tool_results = []
+                clean_response = response
 
                 for call in tool_calls:
-                    result=self._execute_tool_call(call['tool_name'],call['parameters'])
+                    result = self._execute_tool_call(call['tool_name'], call['parameters'])
                     tool_results.append(result)
                     # 从响应中移除工具调用标记
-                    clean_response=clean_response.replace(call['original'],"")
+                    clean_response = clean_response.replace(call['original'], "")
 
                 # 构建包含工具结果的消息
                 messages.append({"role": "assistant", "content": clean_response})
@@ -313,19 +330,26 @@ class SimpleAgent(Agent):
                 continue
 
             # 如果没有工具调用，这是最终回答
-            final_response=response
+            final_response = response
             break
 
         # 如果超过最大迭代次数，获取最后一次回答
-        if current_iteration>=max_tool_iterations and not final_response:
-            final_response=self.llm.invoke(messages,**kwargs)
+        if current_iteration >= max_tool_iterations and not final_response:
+            final_response = self.llm.invoke(messages, **kwargs)
 
-        self.add_message(Message(input_text,"user"))
-        self.add_message(Message(final_response,"assistant"))
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(final_response, "assistant"))
+
+        self._log.event("agent_answer", {
+            "answer": final_response,
+            "tool_iterations": current_iteration,
+            "total_duration_ms": int((time.time() - t_start) * 1000),
+        })
+        self._log.close(final_answer=final_response)
 
         return final_response
 
-    def add_tool(self,tool)->None:
+    def add_tool(self, tool) -> None:
         """
         添加工具到Agent（便利方法）
 
@@ -333,40 +357,40 @@ class SimpleAgent(Agent):
         """
         if not self.tool_registry:
             from tools.registry import ToolRegistry
-            self.tool_registry=ToolRegistry()
-            self.enable_tool_calling=True
+            self.tool_registry = ToolRegistry()
+            self.enable_tool_calling = True
 
         # 检查是否是MCP工具且需要展开
-        if hasattr(tool,'auto_expand') and tool.auto_expand:
-            #获取展开的工具列表
-            expanded_tools=tool.get_expanded_tools()
+        if hasattr(tool, 'auto_expand') and tool.auto_expand:
+            # 获取展开的工具列表
+            expanded_tools = tool.get_expanded_tools()
             if expanded_tools:
-                #注册所有展开的工具
+                # 注册所有展开的工具
                 for expanded_tool in expanded_tools:
                     self.tool_registry.register_tool(expanded_tool)
-                print(f"✅ MCP工具 '{tool.name}' 已展开为 {len(expanded_tools)} 个独立工具")
+                self._log.console(f"✅ MCP工具 '{tool.name}' 已展开为 {len(expanded_tools)} 个独立工具")
                 return
 
-                # 普通工具或不展开的MCP工具
-            self.tool_registry.register_tool(tool)
+        # 普通工具或不展开的MCP工具
+        self.tool_registry.register_tool(tool)
 
-    def remove_tool(self,tool_name:str)->bool:
+    def remove_tool(self, tool_name: str) -> bool:
         """移除工具（便利方法）"""
         if self.tool_registry:
             return self.tool_registry.unregister_tool(tool_name)
         return False
 
-    def list_tools(self)->list:
+    def list_tools(self) -> list:
         """列出所有可用工具"""
         if self.tool_registry:
             return self.tool_registry.list_tools()
         return []
 
-    def has_tools(self)->bool:
+    def has_tools(self) -> bool:
         """检查是否有可用工具"""
         return self.enable_tool_calling and self.tool_registry is not None
 
-    def stream_run(self,input_text:str,**kwargs)->Iterator[str]:
+    def stream_run(self, input_text: str, **kwargs) -> Iterator[str]:
         """
         流式运行Agent
 
@@ -375,22 +399,22 @@ class SimpleAgent(Agent):
         :yields:Agent响应片段
         """
 
-        #构建消息列表
-        messages=[]
+        # 构建消息列表
+        messages = []
 
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
 
         for msg in self._history:
-            messages.append({"role":msg.role, "content": msg.content})
+            messages.append({"role": msg.role, "content": msg.content})
 
         messages.append({"role": "user", "content": input_text})
 
         # 流式调用llm
-        full_response=""
-        for chunk in self.llm.stream.invoke(messages,**kwargs):
+        full_response = ""
+        for chunk in self.llm.stream_invoke(messages, **kwargs):
             full_response += chunk
             yield chunk
 
-        self.add_message(Message(input_text,"user"))
-        self.add_message(Message(full_response,"assistant"))
+        self.add_message(Message(input_text, "user"))
+        self.add_message(Message(full_response, "assistant"))

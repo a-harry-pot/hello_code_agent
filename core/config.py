@@ -57,6 +57,11 @@ class Config(BaseModel):
     # ==================== 存储配置 ====================
     helloagents_dir: str = Field(default=".helloagents", description="状态存储目录")
 
+    # ==================== 日志配置 ====================
+    log_enabled: bool = Field(default=True, description="启用会话日志持久化")
+    log_dir: str = Field(default="logs", description="日志输出目录（相对于 helloagents_dir）")
+    log_truncate_content: int = Field(default=10000, gt=0, description="日志中内容截断长度")
+
     # ==================== 安全配置 ====================
     confirm_delete_files: bool = Field(default=True, description="删除文件需要确认")
     confirm_large_changes: bool = Field(default=True, description="大规模变更需要确认")
@@ -78,6 +83,7 @@ class Config(BaseModel):
             "log_level": os.getenv("LOG_LEVEL", "INFO"),
             "temperature": float(os.getenv("TEMPERATURE", "0.7")),
             "helloagents_dir": os.getenv("HELLOAGENTS_DIR", os.getenv("CODE_AGENT_STATE_DIR", ".helloagents")),
+            "log_dir": os.getenv("CODE_AGENT_LOG_DIR", "logs"),
             "max_react_steps": int(os.getenv("CODE_AGENT_MAX_REACT_STEPS", os.getenv("CODE_AGENT_MAX_STEPS", "20"))),
             "llm_timeout": int(os.getenv("LLM_TIMEOUT", "60")),
             "terminal_timeout": int(os.getenv("CODE_AGENT_TERMINAL_TIMEOUT", "60")),
@@ -99,6 +105,10 @@ class Config(BaseModel):
         if state_path.is_absolute():
             return state_path
         return repo_root / state_path
+
+    def get_log_dir(self, repo_root: Path) -> Path:
+        """获取日志目录的绝对路径"""
+        return self.get_state_dir(repo_root) / self.log_dir
 
     def get_notes_dir(self, repo_root: Path) -> Path:
         """获取笔记目录"""

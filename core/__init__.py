@@ -6,6 +6,7 @@
 
 from .exceptions import HelloAgentsException
 from .llm import HelloAgentsLLM
+from .session_logger import SessionLogger, _NoopLogger
 
 try:
     from .agent import Agent
@@ -16,4 +17,4 @@ except Exception:  # optional deps may be missing in minimal environments
     Config = None  # type: ignore[assignment]
     Message = None  # type: ignore[assignment]
 
-__all__ = ["HelloAgentsLLM", "HelloAgentsException", "Agent", "Config", "Message"]
+__all__ = ["HelloAgentsLLM", "HelloAgentsException", "Agent", "Config", "Message", "SessionLogger"]

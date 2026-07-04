@@ -5,6 +5,7 @@ from typing import Optional
 from .message import Message
 from .llm import HelloAgentsLLM
 from .config import Config
+from .session_logger import SessionLogger, _NoopLogger
 
 
 class Agent(ABC):
@@ -16,12 +17,14 @@ class Agent(ABC):
             llm: HelloAgentsLLM,
             system_prompt: Optional[str] = None,
             config: Optional[Config] = None,
+            session_logger: Optional[SessionLogger] = None,
     ):
         self.name = name
         self.llm = llm
         self.system_prompt = system_prompt
         self.config = config or Config()
-        self._history:list[Message] = []
+        self._history: list[Message] = []
+        self._log = session_logger or _NoopLogger()
 
     @abstractmethod
     def run(self,input_text:str,**kwargs)->str:

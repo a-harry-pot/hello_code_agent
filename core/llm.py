@@ -1,10 +1,12 @@
 """HelloAgents统一LLM接口 - 基于OpenAI原生API"""
 
 import os
+import time
 from typing import Literal, Optional, Iterator
 from openai import OpenAI
 
 from .exceptions import HelloAgentsException
+from .session_logger import SessionLogger, _NoopLogger
 
 # 支持的LLM提供商
 SUPPORTED_PROVIDERS = Literal[
@@ -33,6 +35,7 @@ class HelloAgentsLLM:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
+        session_logger: Optional[SessionLogger] = None,
         **kwargs
     ):
         """
@@ -47,7 +50,9 @@ class HelloAgentsLLM:
             temperature: 温度参数
             max_tokens: 最大token数
             timeout: 超时时间，从环境变量LLM_TIMEOUT读取，默认60秒
+            session_logger: 会话日志记录器（可选）
         """
+        self._log = session_logger or _NoopLogger()
         # 优先使用传入参数，如果未提供，则从环境变量加载
         self.model = model or os.getenv("LLM_MODEL_ID")
         self.temperature = temperature
@@ -272,27 +277,63 @@ class HelloAgentsLLM:
         Yields:
             str: 流式响应的文本片段
         """
-        print(f"🧠 正在调用 {self.model} 模型...")
+        self._log.console(f"🧠 正在调用 {self.model} 模型...")
+        temp = temperature if temperature is not None else self.temperature
+        self._log.event("llm_call", {
+            "call_type": "think",
+            "model": self.model,
+            "message_count": len(messages),
+            "messages_preview": [_msg_preview(m) for m in messages[:8]],
+            "temperature": temp,
+            "max_tokens": self.max_tokens,
+            "streaming": True,
+        })
+
+        t0 = time.time()
+        full_response = ""
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=temperature if temperature is not None else self.temperature,
+                temperature=temp,
                 max_tokens=self.max_tokens,
                 stream=True,
             )
 
-            # 处理流式响应
-            print("✅ 大语言模型响应成功:")
+            self._log.console("✅ 大语言模型响应成功:")
             for chunk in response:
                 content = chunk.choices[0].delta.content or ""
                 if content:
                     print(content, end="", flush=True)
+                    full_response += content
                     yield content
-            print()  # 在流式输出结束后换行
+            print()
+
+            latency_ms = int((time.time() - t0) * 1000)
+            self._log.event("llm_call", {
+                "call_type": "think",
+                "model": self.model,
+                "message_count": len(messages),
+                "temperature": temp,
+                "max_tokens": self.max_tokens,
+                "streaming": True,
+                "response": full_response,
+                "response_length": len(full_response),
+                "latency_ms": latency_ms,
+            })
 
         except Exception as e:
-            print(f"❌ 调用LLM API时发生错误: {e}")
+            latency_ms = int((time.time() - t0) * 1000)
+            self._log.console(f"❌ 调用LLM API时发生错误: {e}")
+            self._log.event("error", {
+                "context": "llm_call",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "call_type": "think",
+                "model": self.model,
+                "latency_ms": latency_ms,
+            })
+            self._log.inc_error()
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
@@ -300,16 +341,54 @@ class HelloAgentsLLM:
         非流式调用LLM，返回完整响应。
         适用于不需要流式输出的场景。
         """
+        temp = kwargs.get('temperature', self.temperature)
+        max_tok = kwargs.get('max_tokens', self.max_tokens)
+        self._log.event("llm_call", {
+            "call_type": "invoke",
+            "model": self.model,
+            "message_count": len(messages),
+            "messages_preview": [_msg_preview(m) for m in messages[:8]],
+            "temperature": temp,
+            "max_tokens": max_tok,
+            "streaming": False,
+        })
+
+        t0 = time.time()
         try:
             response = self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=kwargs.get('temperature', self.temperature),
-                max_tokens=kwargs.get('max_tokens', self.max_tokens),
+                temperature=temp,
+                max_tokens=max_tok,
                 **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
             )
-            return response.choices[0].message.content
+            content = response.choices[0].message.content or ""
+            latency_ms = int((time.time() - t0) * 1000)
+
+            self._log.event("llm_call", {
+                "call_type": "invoke",
+                "model": self.model,
+                "message_count": len(messages),
+                "temperature": temp,
+                "max_tokens": max_tok,
+                "streaming": False,
+                "response": content,
+                "response_length": len(content),
+                "latency_ms": latency_ms,
+            })
+            return content
+
         except Exception as e:
+            latency_ms = int((time.time() - t0) * 1000)
+            self._log.event("error", {
+                "context": "llm_call",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "call_type": "invoke",
+                "model": self.model,
+                "latency_ms": latency_ms,
+            })
+            self._log.inc_error()
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> Iterator[str]:
@@ -319,3 +398,11 @@ class HelloAgentsLLM:
         """
         temperature = kwargs.get('temperature')
         yield from self.think(messages, temperature)
+
+
+def _msg_preview(msg: dict[str, str]) -> dict[str, str]:
+    """截断消息内容用于日志，避免完整 prompt 撑爆日志文件。"""
+    content = msg.get("content", "")
+    if len(content) > 300:
+        content = content[:300] + "..."
+    return {"role": msg.get("role", "?"), "content": content}

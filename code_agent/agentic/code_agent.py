@@ -10,6 +10,7 @@ from agents.react_agent import ReActAgent
 from core.config import Config
 from core.llm import HelloAgentsLLM
 from core.message import Message
+from core.session_logger import SessionLogger
 from context.builder import ContextBuilder, ContextConfig, ContextPacket
 from tools.registry import ToolRegistry
 from tools.builtin.note_tool import NoteTool
@@ -75,8 +76,18 @@ class CodeAgent:
         self.paths.sessions_dir.mkdir(parents=True,exist_ok=True)
         #memory/logs 仅在需要时创建
 
-        self.session_id=f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        self.llm=llm or HelloAgentsLLM()
+        self.session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.llm = llm or HelloAgentsLLM()
+
+        # 初始化会话日志
+        self.session_logger = SessionLogger(
+            output_dir=self.paths.logs_dir,
+            agent_name="code_agent",
+            agent_type="react",
+            model=self.llm.model or "unknown",
+            provider=self.llm.provider or "unknown",
+            session_id=self.session_id,
+        )
 
         #初始化工具
         self.note_tool=NoteTool(workspace=str(self.paths.notes_dir))
@@ -154,6 +165,7 @@ class CodeAgent:
             custom_prompt=react_prompt,
             observation_summarizer=_summarize_observation,
             summarize_threshold_chars=1800,
+            session_logger=self.session_logger,
         )
 
         base_system=(self.paths.prompts_dir/"system.md").read_text(encoding="utf-8")

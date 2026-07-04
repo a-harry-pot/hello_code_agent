@@ -64,7 +64,7 @@ class TerminalTool(Tool):
     # 不包含可能修改系统或造成安全风险的命令（如rm、mv、chmod等）
     ALLOWED_COMMANDS = {
         # 文件列表与信息
-        'ls', 'dir', 'tree','dir'
+        'ls', 'dir', 'tree','dir',
         # 文件内容查看
         'cat', 'head', 'tail', 'less', 'more',
         # 文件搜索
