@@ -67,7 +67,7 @@ class GrepTool(Tool):
         # 调用基类初始化（注入 project_root）
         super().__init__(
             name=name,
-            description=grep_prompt,
+            description="grep文件搜索工具-用正则表达式搜索文件内容，结果按修改时间排序",
             project_root=project_root,
         )
         

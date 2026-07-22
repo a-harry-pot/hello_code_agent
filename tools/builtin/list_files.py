@@ -53,7 +53,7 @@ class ListFilesTool(Tool):
         # 调用基类初始化（注入 project_root 和 working_dir）
         super().__init__(
             name=name,
-            description=LS_prompt,
+            description="文件浏览器工具-安全的目录浏览工具，支持分页与过滤",
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )

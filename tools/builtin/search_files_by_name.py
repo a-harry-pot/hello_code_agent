@@ -59,7 +59,7 @@ class SearchFilesByNameTool(Tool):
         # 调用基类初始化（注入 project_root）
         super().__init__(
             name=name,
-            description=glob_prompt,
+            description="glob文件搜索工具-用 glob 模式按文件名查找文件",
             project_root=project_root,
         )
         

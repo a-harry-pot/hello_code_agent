@@ -45,7 +45,7 @@ class EditTool(Tool):
 
         super().__init__(
             name=name,
-            description=edit_prompt,
+            description="单次编辑工具 (Edit)-对已有文件做精确的单次文本替换。old_string 必须在文件中唯一出现",
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )

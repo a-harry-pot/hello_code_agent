@@ -8,7 +8,7 @@ import re
 
 ALLOWED_COMMANDS = {
         # 文件列表与信息
-        'ls', 'dir', 'tree','dir'
+        'ls', 'dir', 'tree','dir',
         # 文件内容查看
         'cat', 'head', 'tail', 'less', 'more',
         # 文件搜索
@@ -154,5 +154,17 @@ def _split_shell_segments(command: str) -> List[str]:
 
 
 
-command="cmd /c dir /s /b terminal_tool.py"
+command="cat terminal_tool.py"
+current_dir="D:\ACode\HelloCodeAgent"
+result = subprocess.run(
+                command,
+                shell=True,
+                cwd=str(current_dir),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=os.environ.copy(),
+            )
+output = (result.stdout or "") + (result.stderr or "")
 print(_shell_all_commands_whitelisted(command))
+print(output)

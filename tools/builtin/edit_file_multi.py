@@ -52,7 +52,7 @@ class MultiEditTool(Tool):
         
         super().__init__(
             name=name,
-            description=multi_edit_prompt,
+            description="多次编辑工具 (MultiEdit)-对同一文件做多次独立修改，原子性批量应用。所有 old_string 均基于原始文件匹配",
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )

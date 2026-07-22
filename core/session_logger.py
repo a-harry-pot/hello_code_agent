@@ -75,11 +75,19 @@ class SessionLogger:
 
     # ---- Public API ----
 
+    def _ensure_open(self) -> None:
+        """如果文件已关闭，重新打开（追加模式），支持跨多次 run() 复用。"""
+        if self._jsonl_file.closed:
+            self._jsonl_file = open(self.jsonl_path, "a", encoding="utf-8")
+        if self._text_file.closed:
+            self._text_file = open(self.text_path, "a", encoding="utf-8")
+
     def console(self, *args, sep: str = " ") -> None:
         """写入控制台（保留 ANSI）和文本日志（去除 ANSI）。
 
         接受多参数，行为与 print() 一致。
         """
+        self._ensure_open()
         msg = sep.join(str(a) for a in args)
         print(*args, sep=sep)
         clean = _ANSI_RE.sub("", msg)
@@ -88,6 +96,7 @@ class SessionLogger:
 
     def event(self, event_type: str, data: dict | None = None) -> None:
         """写入一条结构化事件到 JSONL，同时写一行摘要到文本日志。"""
+        self._ensure_open()
         record = {
             "session_id": self.session_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),

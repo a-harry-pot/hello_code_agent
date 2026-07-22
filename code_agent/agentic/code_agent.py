@@ -12,6 +12,15 @@ from core.llm import HelloAgentsLLM
 from core.message import Message
 from core.session_logger import SessionLogger
 from context.builder import ContextBuilder, ContextConfig, ContextPacket
+from tools.builtin.bash import BashTool
+from tools.builtin.edit_file import EditTool
+from tools.builtin.edit_file_multi import MultiEditTool
+from tools.builtin.list_files import ListFilesTool
+from tools.builtin.read_file import ReadTool
+from tools.builtin.search_code import GrepTool
+from tools.builtin.search_files_by_name import SearchFilesByNameTool
+from tools.builtin.todo_write import TodoWriteTool
+from tools.builtin.write_file import WriteTool
 from tools.registry import ToolRegistry
 from tools.builtin.note_tool import NoteTool
 from tools.builtin.terminal_tool import TerminalTool
@@ -90,24 +99,25 @@ class CodeAgent:
         )
 
         #初始化工具
-        self.note_tool=NoteTool(workspace=str(self.paths.notes_dir))
-        #类似Claude Code：默认允许Shell语法（管道等），但危险操作需要确认
-        self.terminal_tool=TerminalTool(
-            workspace=str(self.paths.repo_root),
-            timeout=60,
-            confirm_dangerous=True,
-            default_shell_mode=True
+        self.registry = ToolRegistry()
+        self.registry.register_tool(
+            ListFilesTool(project_root=self.paths.repo_root, working_dir=self.paths.repo_root)
         )
-        self.todo_tool=TodoTool(workspace=str(self.paths.helloagents_dir/"todos"))
+        self.registry.register_tool(SearchFilesByNameTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(GrepTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(ReadTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(WriteTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(EditTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(MultiEditTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(TodoWriteTool(project_root=self.paths.repo_root))
+        self.registry.register_tool(BashTool(project_root=self.paths.repo_root))
+        self.note_tool=NoteTool(workspace=str(self.paths.notes_dir))
+        self.registry.register_tool(self.note_tool)
 
         # ReActAgent 的工具注册表
         # 核心工具：terminal, note, memory, plan
         # 扩展上下文工具：context_fetch（让模型按需获取更多证据）
-        self.registry = ToolRegistry()
-        self.registry.register_tool(self.terminal_tool)
-        self.registry.register_tool(self.note_tool)
         self.registry.register_tool(PlanTool(self.llm, prompt_path=str(self.paths.prompts_dir / "plan.md")))
-        self.registry.register_tool(self.todo_tool)
 
         #注册上下文获取工具
         self.context_fetch_tool=ContextFetchTool(

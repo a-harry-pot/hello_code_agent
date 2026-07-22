@@ -53,7 +53,7 @@ class TodoWriteTool(Tool):
         """
         super().__init__(
             name=name,
-            description=TodoWrite_prompt,
+            description="任务列表管理工具-支持声明式覆盖更新",
             project_root=project_root,
             working_dir=project_root,
         )
