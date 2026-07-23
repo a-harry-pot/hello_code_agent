@@ -308,21 +308,29 @@ class CodeAgent:
         if any(p in user_input for p in multi_patterns):
             multistep_hint = "提示：本任务包含多个步骤，先用 todo 记录/更新，再执行；收尾用 todo list 汇总。"
 
-        # 构建保底上下文（系统提示 + 对话历史 + 上次工具摘要 + 可选 hint）
-        # 扩展上下文由模型通过 context_fetch 工具按需获取
+        # 构建用户上下文（对话历史 + 工具摘要），拼入 user_input 尾巴
+        history_lines = [
+            f"[{m.role}] {m.content}"
+            for m in self.history[-10:]  # 最近 10 条
+        ] if self.history else []
+
         tool_summaries = []
         for packet in self.recent_tool_packets[-3:]:
             tool_summaries.append(packet.content)
 
-        context_text=self.context_builder.build_base(
-            user_query=user_input,
-            conversation_history=self.history,
-            system_instructions=self.system_prompt + ("\n" + multistep_hint if multistep_hint else ""),
-            tool_summaries=tool_summaries if tool_summaries else None,
-        )
+        extra_parts = []
+        if multistep_hint:
+            extra_parts.append(multistep_hint)
+        if history_lines:
+            extra_parts.append("## 对话历史\n" + "\n".join(history_lines))
+        if tool_summaries:
+            extra_parts.append("## 上次工具结果摘要\n" + "\n".join(tool_summaries))
 
-        #将拼接好的上下文作为“问题”输入给ReAct
-        response=self.react.run(context_text,max_tokens=8000)
+        full_input = user_input
+        if extra_parts:
+            full_input = user_input + "\n\n" + "\n\n".join(extra_parts)
+
+        response = self.react.run(full_input, max_tokens=8000)
 
         #收集本轮工具的执行证据（已在 ReActAgent 内部摘要)
         try:
