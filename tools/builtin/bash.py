@@ -67,7 +67,7 @@ class BashTool(Tool):
 
         super().__init__(
             name=name,
-            description="Shell 命令执行工具 - 在项目根目录沙箱内执行 Shell 命令，支持命令串联与受限 cd",
+            description=bash_prompt,
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )

@@ -1,17 +1,19 @@
 """HelloAgents统一LLM接口 - 基于OpenAI原生API"""
 
+import logging
 import os
 import time
-from typing import Literal, Optional, Iterator
+from typing import Literal, Optional, Iterator, Dict
 from openai import OpenAI
 
 from .exceptions import HelloAgentsException
-from .session_logger import SessionLogger, _NoopLogger
+
+logger = logging.getLogger(__name__)
 
 # 支持的LLM提供商
 SUPPORTED_PROVIDERS = Literal[
     "openai", "deepseek", "qwen", "modelscope",
-    "kimi", "zhipu", "ollama", "vllm", "local", "auto"
+    "kimi", "zhipu", "siliconflow", "ollama", "vllm", "local", "auto"
 ]
 
 class HelloAgentsLLM:
@@ -35,7 +37,6 @@ class HelloAgentsLLM:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         timeout: Optional[int] = None,
-        session_logger: Optional[SessionLogger] = None,
         **kwargs
     ):
         """
@@ -50,21 +51,27 @@ class HelloAgentsLLM:
             temperature: 温度参数
             max_tokens: 最大token数
             timeout: 超时时间，从环境变量LLM_TIMEOUT读取，默认60秒
-            session_logger: 会话日志记录器（可选）
         """
-        self._log = session_logger or _NoopLogger()
+        # 优先加载 .env（如存在则读取配置）
+        self._dotenv_values: Dict[str, str] = {}
+        self._load_dotenv_first()
+
         # 优先使用传入参数，如果未提供，则从环境变量加载
-        self.model = model or os.getenv("LLM_MODEL_ID")
+        self.model = model or self._get_env("LLM_MODEL_ID")
         self.temperature = temperature
         self.max_tokens = max_tokens
-        self.timeout = timeout or int(os.getenv("LLM_TIMEOUT", "60"))
+        self.timeout = timeout or int(self._get_env("LLM_TIMEOUT", "120"))
+        self.max_retries = int(self._get_env("LLM_MAX_RETRIES", "2"))
+        self.retry_backoff = float(self._get_env("LLM_RETRY_BACKOFF", "1.0"))
         self.kwargs = kwargs
+        self._temperature_policy_notice_emitted = False
 
         # 自动检测provider或使用指定的provider
-        self.provider = provider or self._auto_detect_provider(api_key, base_url)
+        self.provider = self._resolve_provider(provider, api_key, base_url)
 
         # 根据provider确定API密钥和base_url
-        self.api_key, self.base_url = self._resolve_credentials(api_key, base_url)
+        self.api_key, resolved_base_url = self._resolve_credentials(api_key, base_url)
+        self.base_url = self._normalize_base_url(resolved_base_url)
 
         # 验证必要参数
         if not self.model:
@@ -74,6 +81,75 @@ class HelloAgentsLLM:
 
         # 创建OpenAI客户端
         self._client = self._create_client()
+
+    def _load_dotenv_first(self) -> None:
+        """
+        优先加载 .env 中的配置。
+        若 .env 不存在或未配置对应键，则自然回退到系统环境变量。
+        """
+        try:
+            from dotenv import load_dotenv, find_dotenv, dotenv_values
+        except Exception:
+            return
+
+        dotenv_path = find_dotenv(usecwd=True)
+        if dotenv_path:
+            values = dotenv_values(dotenv_path)
+            # 仅保留有值的键
+            self._dotenv_values = {
+                k: v for k, v in values.items() if v is not None and str(v).strip() != ""
+            }
+            # 读取但不覆盖系统环境变量（优先级由 _get_env 控制）
+            load_dotenv(dotenv_path, override=False)
+        else:
+            # 尝试当前目录（如无 .env 将无效果）
+            values = dotenv_values()
+            self._dotenv_values = {
+                k: v for k, v in values.items() if v is not None and str(v).strip() != ""
+            }
+            load_dotenv(override=False)
+
+    def _get_env(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """
+        优先从 .env 读取配置；若无则回退系统环境变量。
+        """
+        if key in self._dotenv_values:
+            return self._dotenv_values.get(key)
+        return os.getenv(key, default)
+
+    def _resolve_provider(self, provider: Optional[str], api_key: Optional[str], base_url: Optional[str]) -> str:
+        """
+        解析 provider：
+        1) 显式参数 provider
+        2) 环境变量/ .env 中的 LLM_PROVIDER
+        3) 自动探测
+        """
+        if provider:
+            return self._normalize_provider(provider)
+        env_provider = self._get_env("LLM_PROVIDER")
+        if env_provider:
+            return self._normalize_provider(env_provider)
+        return self._auto_detect_provider(api_key, base_url)
+
+    def _normalize_provider(self, provider: str) -> str:
+        """标准化 provider 名称，兼容大小写和常见别名。"""
+        normalized = provider.strip().lower()
+        aliases = {
+            "silicon-flow": "siliconflow",
+            "silicon_flow": "siliconflow",
+        }
+        return aliases.get(normalized, normalized)
+
+    def _normalize_base_url(self, base_url: Optional[str]) -> Optional[str]:
+        """将误填的完整接口路径归一化为 OpenAI 客户端所需的 base_url。"""
+        if not base_url:
+            return base_url
+        normalized = base_url.strip().rstrip("/")
+        for suffix in ("/chat/completions", "/completions"):
+            if normalized.lower().endswith(suffix):
+                normalized = normalized[: -len(suffix)]
+                break
+        return normalized
 
     def _auto_detect_provider(self, api_key: Optional[str], base_url: Optional[str]) -> str:
         """
@@ -85,26 +161,34 @@ class HelloAgentsLLM:
         3. 根据base_url判断
         4. 默认返回通用配置
         """
-        # 1. 检查特定提供商的环境变量
-        if os.getenv("OPENAI_API_KEY"):
-            return "openai"
-        if os.getenv("DEEPSEEK_API_KEY"):
-            return "deepseek"
-        if os.getenv("DASHSCOPE_API_KEY"):
-            return "qwen"
-        if os.getenv("MODELSCOPE_API_KEY"):
-            return "modelscope"
-        if os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY"):
-            return "kimi"
-        if os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY"):
-            return "zhipu"
-        if os.getenv("OLLAMA_API_KEY") or os.getenv("OLLAMA_HOST"):
-            return "ollama"
-        if os.getenv("VLLM_API_KEY") or os.getenv("VLLM_HOST"):
-            return "vllm"
+        # 1. 检查特定提供商的环境变量（若命中多个则报错）
+        env_map = {
+            "openai": ["OPENAI_API_KEY"],
+            "zhipu": ["ZHIPU_API_KEY", "GLM_API_KEY"],
+            "deepseek": ["DEEPSEEK_API_KEY"],
+            "qwen": ["DASHSCOPE_API_KEY"],
+            "modelscope": ["MODELSCOPE_API_KEY"],
+            "kimi": ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
+            "siliconflow": ["SILICONFLOW_API_KEY"],
+            "ollama": ["OLLAMA_API_KEY", "OLLAMA_HOST"],
+            "vllm": ["VLLM_API_KEY", "VLLM_HOST"],
+        }
+        hits = []
+        for prov, keys in env_map.items():
+            for key in keys:
+                if self._get_env(key):
+                    hits.append(prov)
+                    break
+        if len(hits) > 1:
+            providers = ", ".join(sorted(set(hits)))
+            raise HelloAgentsException(
+                f"检测到多个 provider 配置: {providers}。请显式设置 provider 或 LLM_PROVIDER。"
+            )
+        if len(hits) == 1:
+            return hits[0]
 
         # 2. 根据API密钥格式判断
-        actual_api_key = api_key or os.getenv("LLM_API_KEY")
+        actual_api_key = api_key or self._get_env("LLM_API_KEY")
         if actual_api_key:
             actual_key_lower = actual_api_key.lower()
             if actual_api_key.startswith("ms-"):
@@ -123,7 +207,7 @@ class HelloAgentsLLM:
                 return "zhipu"
 
         # 3. 根据base_url判断
-        actual_base_url = base_url or os.getenv("LLM_BASE_URL")
+        actual_base_url = base_url or self._get_env("LLM_BASE_URL")
         if actual_base_url:
             base_url_lower = actual_base_url.lower()
             if "api.openai.com" in base_url_lower:
@@ -138,6 +222,8 @@ class HelloAgentsLLM:
                 return "kimi"
             elif "open.bigmodel.cn" in base_url_lower:
                 return "zhipu"
+            elif "api.siliconflow.cn" in base_url_lower:
+                return "siliconflow"
             elif "localhost" in base_url_lower or "127.0.0.1" in base_url_lower:
                 # 本地部署检测 - 优先检查特定服务
                 if ":11434" in base_url_lower or "ollama" in base_url_lower:
@@ -164,54 +250,59 @@ class HelloAgentsLLM:
     def _resolve_credentials(self, api_key: Optional[str], base_url: Optional[str]) -> tuple[str, str]:
         """根据provider解析API密钥和base_url"""
         if self.provider == "openai":
-            resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://api.openai.com/v1"
+            resolved_api_key = api_key or self._get_env("OPENAI_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://api.openai.com/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "deepseek":
-            resolved_api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://api.deepseek.com"
+            resolved_api_key = api_key or self._get_env("DEEPSEEK_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://api.deepseek.com"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "qwen":
-            resolved_api_key = api_key or os.getenv("DASHSCOPE_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            resolved_api_key = api_key or self._get_env("DASHSCOPE_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "modelscope":
-            resolved_api_key = api_key or os.getenv("MODELSCOPE_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://api-inference.modelscope.cn/v1/"
+            resolved_api_key = api_key or self._get_env("MODELSCOPE_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://api-inference.modelscope.cn/v1/"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "kimi":
-            resolved_api_key = api_key or os.getenv("KIMI_API_KEY") or os.getenv("MOONSHOT_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://api.moonshot.cn/v1"
+            resolved_api_key = api_key or self._get_env("KIMI_API_KEY") or self._get_env("MOONSHOT_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://api.moonshot.cn/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "zhipu":
-            resolved_api_key = api_key or os.getenv("ZHIPU_API_KEY") or os.getenv("GLM_API_KEY") or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4"
+            resolved_api_key = api_key or self._get_env("ZHIPU_API_KEY") or self._get_env("GLM_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4"
+            return resolved_api_key, resolved_base_url
+
+        elif self.provider == "siliconflow":
+            resolved_api_key = api_key or self._get_env("SILICONFLOW_API_KEY") or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("SILICONFLOW_BASE_URL") or self._get_env("LLM_BASE_URL") or "https://api.siliconflow.cn/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "ollama":
-            resolved_api_key = api_key or os.getenv("OLLAMA_API_KEY") or os.getenv("LLM_API_KEY") or "ollama"
-            resolved_base_url = base_url or os.getenv("OLLAMA_HOST") or os.getenv("LLM_BASE_URL") or "http://localhost:11434/v1"
+            resolved_api_key = api_key or self._get_env("OLLAMA_API_KEY") or self._get_env("LLM_API_KEY") or "ollama"
+            resolved_base_url = base_url or self._get_env("OLLAMA_HOST") or self._get_env("LLM_BASE_URL") or "http://localhost:11434/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "vllm":
-            resolved_api_key = api_key or os.getenv("VLLM_API_KEY") or os.getenv("LLM_API_KEY") or "vllm"
-            resolved_base_url = base_url or os.getenv("VLLM_HOST") or os.getenv("LLM_BASE_URL") or "http://localhost:8000/v1"
+            resolved_api_key = api_key or self._get_env("VLLM_API_KEY") or self._get_env("LLM_API_KEY") or "vllm"
+            resolved_base_url = base_url or self._get_env("VLLM_HOST") or self._get_env("LLM_BASE_URL") or "http://localhost:8000/v1"
             return resolved_api_key, resolved_base_url
 
         elif self.provider == "local":
-            resolved_api_key = api_key or os.getenv("LLM_API_KEY") or "local"
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL") or "http://localhost:8000/v1"
+            resolved_api_key = api_key or self._get_env("LLM_API_KEY") or "local"
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL") or "http://localhost:8000/v1"
             return resolved_api_key, resolved_base_url
 
         else:
             # auto或其他情况：使用通用配置，支持任何OpenAI兼容的服务
-            resolved_api_key = api_key or os.getenv("LLM_API_KEY")
-            resolved_base_url = base_url or os.getenv("LLM_BASE_URL")
+            resolved_api_key = api_key or self._get_env("LLM_API_KEY")
+            resolved_base_url = base_url or self._get_env("LLM_BASE_URL")
             return resolved_api_key, resolved_base_url
 
     def _create_client(self) -> OpenAI:
@@ -221,6 +312,87 @@ class HelloAgentsLLM:
             base_url=self.base_url,
             timeout=self.timeout
         )
+
+    @staticmethod
+    def _compact_request_kwargs(kwargs: dict) -> dict:
+        """Drop None-valued fields before provider request dispatch."""
+        return {k: v for k, v in kwargs.items() if v is not None}
+
+    def _is_minimax_backend(self) -> bool:
+        base = (self.base_url or "").lower()
+        return "minimaxi.com" in base or "minimax.io" in base
+
+    def _apply_provider_compat(self, request_kwargs: dict) -> dict:
+        """Apply backend-specific request normalization."""
+        normalized = dict(request_kwargs)
+        if self._is_minimax_backend():
+            normalized["n"] = 1
+            if normalized.get("tool_choice") == "auto":
+                normalized.pop("tool_choice", None)
+        return normalized
+
+    def _normalize_messages_for_provider(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Normalize message list for backend-specific constraints."""
+        if not self._is_minimax_backend():
+            return messages
+        if not isinstance(messages, list) or len(messages) <= 1:
+            return messages
+        system_messages = [m for m in messages if isinstance(m, dict) and str(m.get("role") or "") == "system"]
+        if len(system_messages) <= 1:
+            return messages
+
+        merged_parts: list[str] = []
+        for m in system_messages:
+            content = m.get("content")
+            if content is None:
+                continue
+            text = str(content).strip()
+            if text:
+                merged_parts.append(text)
+        merged_system = {"role": "system", "content": "\n\n".join(merged_parts)}
+        non_system = [m for m in messages if not (isinstance(m, dict) and str(m.get("role") or "") == "system")]
+        if merged_system["content"]:
+            return [merged_system] + non_system
+        return non_system
+
+    def _requires_temperature_one(self) -> bool:
+        """Kimi 2.5 / K2 系列模型仅接受 temperature=1。"""
+        if self.provider != "kimi":
+            return False
+        model = (self.model or "").strip().lower()
+        if not model:
+            return False
+        strict_markers = (
+            "kimi2.5",
+            "kimi-2.5",
+            "kimi_2.5",
+            "kimi-k2",
+            "kimi k2",
+            "k2-",
+            "-k2",
+            "/k2",
+            "k2",
+        )
+        return any(marker in model for marker in strict_markers)
+
+    def _resolve_temperature(self, requested: Optional[float]) -> float:
+        """根据模型约束解析 temperature。"""
+        value = self.temperature if requested is None else requested
+        try:
+            temp = float(value)
+        except Exception:
+            temp = float(self.temperature)
+
+        if self._requires_temperature_one() and temp != 1.0:
+            if not self._temperature_policy_notice_emitted:
+                logger.warning(
+                    "模型 %s 仅支持 temperature=1，已自动从 %.3f 调整为 1。",
+                    self.model,
+                    temp,
+                )
+                self._temperature_policy_notice_emitted = True
+            return 1
+        return temp
 
     def _get_default_model(self) -> str:
         """获取默认模型"""
@@ -236,6 +408,8 @@ class HelloAgentsLLM:
             return "moonshot-v1-8k"
         elif self.provider == "zhipu":
             return "glm-4"
+        elif self.provider == "siliconflow":
+            return "Qwen/Qwen2.5-7B-Instruct"
         elif self.provider == "ollama":
             return "llama3.2"  # Ollama常用模型
         elif self.provider == "vllm":
@@ -244,7 +418,7 @@ class HelloAgentsLLM:
             return "local-model"  # 本地模型占位符
         else:
             # auto或其他情况：根据base_url智能推断默认模型
-            base_url = os.getenv("LLM_BASE_URL", "")
+            base_url = self._get_env("LLM_BASE_URL", "") or ""
             base_url_lower = base_url.lower()
             if "modelscope" in base_url_lower:
                 return "Qwen/Qwen2.5-72B-Instruct"
@@ -256,6 +430,8 @@ class HelloAgentsLLM:
                 return "moonshot-v1-8k"
             elif "bigmodel" in base_url_lower:
                 return "glm-4"
+            elif "siliconflow" in base_url_lower:
+                return "Qwen/Qwen2.5-7B-Instruct"
             elif "ollama" in base_url_lower or ":11434" in base_url_lower:
                 return "llama3.2"
             elif ":8000" in base_url_lower or "vllm" in base_url_lower:
@@ -265,7 +441,13 @@ class HelloAgentsLLM:
             else:
                 return "gpt-3.5-turbo"
 
-    def think(self, messages: list[dict[str, str]], temperature: Optional[float] = None) -> Iterator[str]:
+    def think(
+        self,
+        messages: list[dict[str, str]],
+        temperature: Optional[float] = None,
+        tools: Optional[list[dict]] = None,
+        tool_choice: Optional[object] = None,
+    ) -> Iterator[str]:
         """
         调用大语言模型进行思考，并返回流式响应。
         这是主要的调用方法，默认使用流式响应以获得更好的用户体验。
@@ -277,63 +459,32 @@ class HelloAgentsLLM:
         Yields:
             str: 流式响应的文本片段
         """
-        self._log.console(f"🧠 正在调用 {self.model} 模型...")
-        temp = temperature if temperature is not None else self.temperature
-        self._log.event("llm_call", {
-            "call_type": "think",
-            "model": self.model,
-            "message_count": len(messages),
-            "messages_preview": [_msg_preview(m) for m in messages[:8]],
-            "temperature": temp,
-            "max_tokens": self.max_tokens,
-            "streaming": True,
-        })
-
-        t0 = time.time()
-        full_response = ""
+        logger.info("正在调用 %s 模型...", self.model)
         try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temp,
-                max_tokens=self.max_tokens,
-                stream=True,
-            )
+            request_kwargs = {
+                "model": self.model,
+                "messages": self._normalize_messages_for_provider(messages),
+                "temperature": self._resolve_temperature(temperature),
+                "max_tokens": self.max_tokens,
+                "stream": True,
+            }
+            if tools:
+                request_kwargs["tools"] = tools
+                if tool_choice is not None:
+                    request_kwargs["tool_choice"] = tool_choice
+            request_kwargs = self._apply_provider_compat(request_kwargs)
+            request_kwargs = self._compact_request_kwargs(request_kwargs)
+            response = self._client.chat.completions.create(**request_kwargs)
 
-            self._log.console("✅ 大语言模型响应成功:")
+            # 处理流式响应
+            logger.debug("大语言模型响应成功（streaming）")
             for chunk in response:
                 content = chunk.choices[0].delta.content or ""
                 if content:
-                    print(content, end="", flush=True)
-                    full_response += content
                     yield content
-            print()
-
-            latency_ms = int((time.time() - t0) * 1000)
-            self._log.event("llm_call", {
-                "call_type": "think",
-                "model": self.model,
-                "message_count": len(messages),
-                "temperature": temp,
-                "max_tokens": self.max_tokens,
-                "streaming": True,
-                "response": full_response,
-                "response_length": len(full_response),
-                "latency_ms": latency_ms,
-            })
 
         except Exception as e:
-            latency_ms = int((time.time() - t0) * 1000)
-            self._log.console(f"❌ 调用LLM API时发生错误: {e}")
-            self._log.event("error", {
-                "context": "llm_call",
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "call_type": "think",
-                "model": self.model,
-                "latency_ms": latency_ms,
-            })
-            self._log.inc_error()
+            logger.error("调用LLM API时发生错误: %s", e)
             raise HelloAgentsException(f"LLM调用失败: {str(e)}")
 
     def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
@@ -341,55 +492,66 @@ class HelloAgentsLLM:
         非流式调用LLM，返回完整响应。
         适用于不需要流式输出的场景。
         """
-        temp = kwargs.get('temperature', self.temperature)
-        max_tok = kwargs.get('max_tokens', self.max_tokens)
-        self._log.event("llm_call", {
-            "call_type": "invoke",
-            "model": self.model,
-            "message_count": len(messages),
-            "messages_preview": [_msg_preview(m) for m in messages[:8]],
-            "temperature": temp,
-            "max_tokens": max_tok,
-            "streaming": False,
-        })
+        for attempt in range(self.max_retries + 1):
+            try:
+                request_kwargs = {
+                    "model": self.model,
+                    "messages": self._normalize_messages_for_provider(messages),
+                    "temperature": self._resolve_temperature(kwargs.get("temperature")),
+                    "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+                }
+                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ["temperature", "max_tokens"]}
+                if extra_kwargs:
+                    request_kwargs.update(extra_kwargs)
+                request_kwargs = self._apply_provider_compat(request_kwargs)
+                request_kwargs = self._compact_request_kwargs(request_kwargs)
+                response = self._client.chat.completions.create(**request_kwargs)
+                return response.choices[0].message.content
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    raise HelloAgentsException(f"LLM调用失败: {str(e)}")
+                wait_s = self.retry_backoff * (2 ** attempt)
+                logger.warning(
+                    "LLM调用失败，%.1fs后重试（%d/%d）: %s",
+                    wait_s,
+                    attempt + 1,
+                    self.max_retries,
+                    e,
+                )
+                time.sleep(wait_s)
 
-        t0 = time.time()
-        try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temp,
-                max_tokens=max_tok,
-                **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
-            )
-            content = response.choices[0].message.content or ""
-            latency_ms = int((time.time() - t0) * 1000)
-
-            self._log.event("llm_call", {
-                "call_type": "invoke",
-                "model": self.model,
-                "message_count": len(messages),
-                "temperature": temp,
-                "max_tokens": max_tok,
-                "streaming": False,
-                "response": content,
-                "response_length": len(content),
-                "latency_ms": latency_ms,
-            })
-            return content
-
-        except Exception as e:
-            latency_ms = int((time.time() - t0) * 1000)
-            self._log.event("error", {
-                "context": "llm_call",
-                "error_type": type(e).__name__,
-                "error_message": str(e),
-                "call_type": "invoke",
-                "model": self.model,
-                "latency_ms": latency_ms,
-            })
-            self._log.inc_error()
-            raise HelloAgentsException(f"LLM调用失败: {str(e)}")
+    def invoke_raw(self, messages: list[dict[str, str]], **kwargs):
+        """
+        非流式调用LLM，返回原始响应对象。
+        适用于需要查看完整结构的场景。
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                request_kwargs = {
+                    "model": self.model,
+                    "messages": self._normalize_messages_for_provider(messages),
+                    "temperature": self._resolve_temperature(kwargs.get("temperature")),
+                    "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+                }
+                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ["temperature", "max_tokens"]}
+                if extra_kwargs:
+                    request_kwargs.update(extra_kwargs)
+                request_kwargs = self._apply_provider_compat(request_kwargs)
+                request_kwargs = self._compact_request_kwargs(request_kwargs)
+                response = self._client.chat.completions.create(**request_kwargs)
+                return response
+            except Exception as e:
+                if attempt >= self.max_retries:
+                    raise HelloAgentsException(f"LLM调用失败: {str(e)}")
+                wait_s = self.retry_backoff * (2 ** attempt)
+                logger.warning(
+                    "LLM调用失败，%.1fs后重试（%d/%d）: %s",
+                    wait_s,
+                    attempt + 1,
+                    self.max_retries,
+                    e,
+                )
+                time.sleep(wait_s)
 
     def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> Iterator[str]:
         """
@@ -398,11 +560,3 @@ class HelloAgentsLLM:
         """
         temperature = kwargs.get('temperature')
         yield from self.think(messages, temperature)
-
-
-def _msg_preview(msg: dict[str, str]) -> dict[str, str]:
-    """截断消息内容用于日志，避免完整 prompt 撑爆日志文件。"""
-    content = msg.get("content", "")
-    if len(content) > 300:
-        content = content[:300] + "..."
-    return {"role": msg.get("role", "?"), "content": content}

@@ -41,7 +41,7 @@ class WriteTool(Tool):
         
         super().__init__(
             name=name,
-            description="文件写入工具-支持全量覆盖、自动创建目录、diff 预览、dry_run",
+            description=write_prompt,
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )

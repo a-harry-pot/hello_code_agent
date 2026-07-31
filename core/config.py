@@ -1,144 +1,78 @@
-"""配置管理 - Code Agent CLI 统一配置"""
+"""配置管理"""
 
 import os
-from typing import Optional, Dict, Any, List
-from pathlib import Path
-from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from pydantic import BaseModel
 
+from core.env import load_env
+
+load_env()
 
 class Config(BaseModel):
-    """Code Agent CLI 统一配置类
+    """HelloAgents配置类"""
 
-    集中管理所有配置项，支持：
-    - 环境变量加载
-    - 默认值设置
-    - 类型验证
-    """
+    # LLM配置
+    default_model: str = "gpt-3.5-turbo"
+    default_provider: str = "openai"
+    temperature: float = 0.7
+    max_tokens: Optional[int] = None
 
-    # ==================== 基础配置 ====================
-    project_name: str = Field(default="code_agent", description="项目名称")
-    debug: bool = Field(default=False, description="调试模式")
-    log_level: str = Field(default="INFO", description="日志级别")
+    # 系统配置
+    debug: bool = False
+    log_level: str = "INFO"
+    show_react_steps: bool = True
+    show_progress: bool = True
 
-    # ==================== LLM 配置 ====================
-    default_model: str = Field(default="gpt-3.5-turbo", description="默认模型")
-    default_provider: str = Field(default="openai", description="默认提供商")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="温度参数")
-    max_tokens: Optional[int] = Field(default=None, description="最大 token 数")
-    llm_timeout: int = Field(default=60, gt=0, description="LLM 请求超时（秒）")
+    # 历史记录配置
+    max_history_length: int = 100
 
-    # ==================== Agent 配置 ====================
-    max_react_steps: int = Field(default=20, gt=0, le=50, description="ReAct 最大步数")
-    max_history_turns: int = Field(default=50, gt=0, description="最大历史对话轮数")
-    observation_summary_threshold: int = Field(default=2000, gt=0, description="工具输出摘要阈值")
+    # AgentTeams 配置（MVP）
+    enable_agent_teams: bool = False
+    agent_teams_store_dir: str = ".teams"
+    agent_tasks_store_dir: str = ".tasks"
+    teammate_mode: str = "auto"
+    delegate_mode: bool = False
 
-    # ==================== 上下文配置 ====================
-    context_max_tokens: int = Field(default=8000, gt=0, description="上下文最大 token 数")
-    context_reserve_ratio: float = Field(default=0.15, ge=0.0, le=0.5, description="生成预留比例")
-    context_enable_compression: bool = Field(default=True, description="启用上下文压缩")
-    context_lazy_fetch: bool = Field(default=True, description="按需获取上下文")
-
-    # ==================== 工具配置 ====================
-    terminal_timeout: int = Field(default=60, gt=0, description="终端命令超时（秒）")
-    terminal_max_output_size: int = Field(default=10 * 1024 * 1024, gt=0, description="终端输出最大大小")
-    terminal_confirm_dangerous: bool = Field(default=True, description="危险命令需要确认")
-    terminal_allow_shell_mode: bool = Field(default=True, description="允许 Shell 模式")
-    context_fetch_max_tokens: int = Field(default=800, gt=0, description="单个数据源最大 token")
-    context_fetch_context_lines: int = Field(default=5, ge=0, description="代码上下文行数")
-
-    # ==================== 补丁执行器配置 ====================
-    patch_max_files: int = Field(default=10, gt=0, description="单个补丁最大文件数")
-    patch_max_total_lines: int = Field(default=800, gt=0, description="单个补丁最大总行数")
-    patch_allowed_suffixes: List[str] = Field(
-        default=[".py", ".md", ".toml", ".json", ".yml", ".yaml", ".txt", ".html", ".css", ".js", ".ts"],
-        description="允许修改的文件后缀"
-    )
-
-    # ==================== 存储配置 ====================
-    helloagents_dir: str = Field(default=".helloagents", description="状态存储目录")
-
-    # ==================== 日志配置 ====================
-    log_enabled: bool = Field(default=True, description="启用会话日志持久化")
-    log_dir: str = Field(default="logs", description="日志输出目录（相对于 helloagents_dir）")
-    log_truncate_content: int = Field(default=10000, gt=0, description="日志中内容截断长度")
-
-    # ==================== 安全配置 ====================
-    confirm_delete_files: bool = Field(default=True, description="删除文件需要确认")
-    confirm_large_changes: bool = Field(default=True, description="大规模变更需要确认")
-    large_change_threshold_files: int = Field(default=6, gt=0, description="大规模变更文件数阈值")
-    large_change_threshold_lines: int = Field(default=400, gt=0, description="大规模变更行数阈值")
+    # 上下文工程配置（E5）
+    context_window: int = 128000  # 默认 128K tokens
+    compression_threshold: float = 0.8  # 触发压缩的阈值比例
+    min_retain_rounds: int = 10  # 最少保留的轮次数
+    summary_timeout: int = 120  # Summary 生成超时（秒）
+    session_memory_char_budget: int = 4000
+    # 工具消息序列化策略（已弃用，当前固定为 function calling 严格模式）
+    tool_message_format: str = "strict"
 
     @classmethod
-    def from_env(cls, **overrides) -> "Config":
-        """从环境变量创建配置
-
-        环境变量命名规则：
-        - CODE_AGENT_<配置项大写> 或传统命名
-
-        Args:
-            **overrides: 手动覆盖的配置项
-        """
-        env_config = {
-            "debug": os.getenv("DEBUG", "false").lower() == "true" or os.getenv("CODE_AGENT_DEBUG", "false").lower() == "true",
-            "log_level": os.getenv("LOG_LEVEL", "INFO"),
-            "temperature": float(os.getenv("TEMPERATURE", "0.7")),
-            "helloagents_dir": os.getenv("HELLOAGENTS_DIR", os.getenv("CODE_AGENT_STATE_DIR", ".helloagents")),
-            "log_dir": os.getenv("CODE_AGENT_LOG_DIR", "logs"),
-            "max_react_steps": int(os.getenv("CODE_AGENT_MAX_REACT_STEPS", os.getenv("CODE_AGENT_MAX_STEPS", "20"))),
-            "llm_timeout": int(os.getenv("LLM_TIMEOUT", "60")),
-            "terminal_timeout": int(os.getenv("CODE_AGENT_TERMINAL_TIMEOUT", "60")),
-            "patch_max_files": int(os.getenv("CODE_AGENT_PATCH_MAX_FILES", "10")),
-            "patch_max_total_lines": int(os.getenv("CODE_AGENT_PATCH_MAX_LINES", "800")),
-        }
-
-        if os.getenv("MAX_TOKENS"):
-            env_config["max_tokens"] = int(os.getenv("MAX_TOKENS"))
-
-        # 合并覆盖配置
-        env_config.update(overrides)
-
-        return cls(**env_config)
-
-    def get_state_dir(self, repo_root: Path) -> Path:
-        """获取状态存储目录的绝对路径"""
-        state_path = Path(self.helloagents_dir)
-        if state_path.is_absolute():
-            return state_path
-        return repo_root / state_path
-
-    def get_log_dir(self, repo_root: Path) -> Path:
-        """获取日志目录的绝对路径"""
-        return self.get_state_dir(repo_root) / self.log_dir
-
-    def get_notes_dir(self, repo_root: Path) -> Path:
-        """获取笔记目录"""
-        return self.get_state_dir(repo_root) / "notes"
-
-    def get_sessions_dir(self, repo_root: Path) -> Path:
-        """获取会话目录"""
-        return self.get_state_dir(repo_root) / "sessions"
-
-    def get_backups_dir(self, repo_root: Path) -> Path:
-        """获取备份目录"""
-        return self.get_state_dir(repo_root) / "backups"
-
-    def get_todos_dir(self, repo_root: Path) -> Path:
-        """获取待办目录"""
-        return self.get_state_dir(repo_root) / "todos"
+    def from_env(cls) -> "Config":
+        """从环境变量创建配置"""
+        enable_agent_teams_raw = os.getenv("ENABLE_AGENT_TEAMS")
+        if enable_agent_teams_raw is None:
+            # Alternate experimental-teams env flag
+            enable_agent_teams_raw = os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "false")
+        teammate_mode_raw = (os.getenv("TEAMMATE_MODE", "auto") or "auto").strip().lower()
+        if teammate_mode_raw not in {"auto", "in-process", "tmux"}:
+            teammate_mode_raw = "auto"
+        delegate_mode_raw = os.getenv("TEAM_DELEGATE_MODE", "false")
+        return cls(
+            debug=os.getenv("DEBUG", "false").lower() == "true",
+            log_level=os.getenv("LOG_LEVEL", "INFO"),
+            show_react_steps=os.getenv("SHOW_REACT_STEPS", "true").lower() == "true",
+            show_progress=os.getenv("SHOW_PROGRESS", "true").lower() == "true",
+            temperature=float(os.getenv("TEMPERATURE", "0.7")),
+            max_tokens=int(os.getenv("MAX_TOKENS")) if os.getenv("MAX_TOKENS") else None,
+            enable_agent_teams=str(enable_agent_teams_raw).lower() in {"1", "true", "yes", "y", "on"},
+            agent_teams_store_dir=os.getenv("AGENT_TEAMS_STORE_DIR", ".teams"),
+            agent_tasks_store_dir=os.getenv("AGENT_TASKS_STORE_DIR", ".tasks"),
+            teammate_mode=teammate_mode_raw,
+            delegate_mode=str(delegate_mode_raw).lower() in {"1", "true", "yes", "y", "on"},
+            context_window=int(os.getenv("CONTEXT_WINDOW", "128000")),
+            compression_threshold=float(os.getenv("COMPRESSION_THRESHOLD", "0.8")),
+            min_retain_rounds=int(os.getenv("MIN_RETAIN_ROUNDS", "10")),
+            summary_timeout=int(os.getenv("SUMMARY_TIMEOUT", "120")),
+            session_memory_char_budget=int(os.getenv("SESSION_MEMORY_CHAR_BUDGET", "4000")),
+            tool_message_format=os.getenv("TOOL_MESSAGE_FORMAT", "strict"),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return self.dict()
-
-    def print_summary(self):
-        """打印配置摘要"""
-        print("=" * 50)
-        print("Code Agent CLI 配置")
-        print("=" * 50)
-        print(f"调试模式: {self.debug}")
-        print(f"ReAct 步数: {self.max_react_steps}")
-        print(f"历史轮数: {self.max_history_turns}")
-        print(f"终端超时: {self.terminal_timeout}s")
-        print(f"补丁限制: {self.patch_max_files} 文件, {self.patch_max_total_lines} 行")
-        print(f"状态目录: {self.helloagents_dir}")
-        print("=" * 50)

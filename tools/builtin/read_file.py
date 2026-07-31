@@ -47,7 +47,7 @@ class ReadTool(Tool):
         
         super().__init__(
             name=name,
-            description="文件读取工具，支持行号、分页、编码回退、mtime 追踪",
+            description=read_prompt,
             project_root=project_root,
             working_dir=working_dir if working_dir else project_root,
         )
