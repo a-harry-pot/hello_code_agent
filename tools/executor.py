@@ -82,8 +82,12 @@ class ToolExecutor:
         if decider is not None:
             decision = decider(name, parameters, self.context.permission_context)
             effective_action = decision.action
-            if effective_action is PermissionAction.ASK and self.context.permission_context.ask_policy == "deny":
-                effective_action = PermissionAction.DENY
+            if effective_action is PermissionAction.ASK:
+                if self.context.permission_context.ask_policy == "ask":
+                    confirmed = self._prompt_user_confirmation(name, parameters, decision)
+                    effective_action = PermissionAction.ALLOW if confirmed else PermissionAction.DENY
+                elif self.context.permission_context.ask_policy == "deny":
+                    effective_action = PermissionAction.DENY
             if (
                 effective_action is PermissionAction.ALLOW
                 and not self.context.permission_checker(name)
@@ -150,6 +154,30 @@ class ToolExecutor:
                 "runtime_mode": self.context.permission_context.runtime_mode,
             },
         }
+
+    @staticmethod
+    def _prompt_user_confirmation(name: str, parameters: dict[str, Any], decision: PermissionDecision) -> bool:
+        """Prompt the user interactively for permission to execute a risky tool call."""
+        import sys
+
+        cmd = parameters.get("command", "")
+        summary = decision.input_summary if decision.input_summary else str(parameters)
+        prompt = (
+            f"\n{'='*60}\n"
+            f"  PERMISSION REQUIRED: {name}\n"
+            f"  Risk: {decision.risk.value.upper()}\n"
+            f"  Reason: {decision.reason}\n"
+            f"  Input: {summary}\n"
+            f"{'='*60}\n"
+            f"  Allow this execution? [y/N] "
+        )
+        try:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            answer = input()
+            return answer.strip().lower() in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
 
     @staticmethod
     def _log_long_term_memory_event(result_payload: dict[str, Any], *, trace_logger, step: int) -> None:

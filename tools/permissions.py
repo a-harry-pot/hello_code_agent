@@ -30,7 +30,7 @@ class RiskLevel(str, Enum):
 @dataclass(frozen=True)
 class PermissionContext:
     runtime_mode: str = "main_agent"
-    ask_policy: str = "deny"
+    ask_policy: str = "ask"
 
 
 @dataclass(frozen=True)
@@ -111,10 +111,6 @@ class RiskClassifier:
             "nested shell execution bypasses command classification",
         ),
         (
-            re.compile(r"(^|[;&|]\s*)(?:python|python3)\s+-c(?:\s|$)"),
-            "inline Python execution bypasses command classification",
-        ),
-        (
             re.compile(r"\|\s*(?:sh|bash|zsh)(?:\s|$)"),
             "piping data into a shell executes unreviewed code",
         ),
@@ -124,6 +120,14 @@ class RiskClassifier:
         ),
     )
     _BASH_ASK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+        (
+            re.compile(r"(^|[;&|]\s*)(?:python|python3)\s+-c(?:\s|$)"),
+            "inline Python execution may run arbitrary code",
+        ),
+        (
+            re.compile(r"(^|[;&|]\s*)(?:python|python3)(?:\s|$)"),
+            "Python execution may have side effects",
+        ),
         (re.compile(r"(^|[;&|]\s*)mv\b"), "mv may rewrite project files"),
         (re.compile(r"(^|[;&|]\s*)cp\b"), "cp may write new project files"),
         (re.compile(r">>?\s*\S"), "shell redirection may overwrite files"),
