@@ -40,6 +40,7 @@ class ContextCompactor:
 
         retain_start_round = len(rounds) - min_rounds
         retain_start_idx = rounds[retain_start_round].start_idx
+        # 保存最近的min_rounds不被压缩，每次压缩是拿源历史进行压缩
         messages_to_compact = source_messages[:retain_start_idx]
         if not messages_to_compact:
             return {"compacted": False, "reason": "no_messages_to_compact"}
