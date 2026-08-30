@@ -66,7 +66,7 @@ class TerminalTool(Tool):
         # 文件列表与信息
         'ls', 'dir', 'tree','dir',
         # 文件内容查看
-        'cat', 'head', 'tail', 'less', 'more',
+        'cat', 'head', 'tail', 'less', 'more','type',
         # 文件搜索
         'find', 'grep', 'egrep', 'fgrep', 'rg',
         # 文本处理
@@ -443,8 +443,14 @@ class TerminalTool(Tool):
             # 获取基础命令（命令名的第一部分）
             base = argv[0]
 
-            if base == "cmd":
-                base = argv[2]
+            if base == "cmd" and len(argv) >= 3:
+                # Windows cmd /c <command> 模式，从 argv[2] 中二次提取实际命令名
+                try:
+                    inner_argv = shlex.split(argv[2])
+                    if inner_argv:
+                        base = inner_argv[0]
+                except Exception:
+                    return False
             
             # 检查基础命令是否在白名单中
             if base not in self.ALLOWED_COMMANDS:

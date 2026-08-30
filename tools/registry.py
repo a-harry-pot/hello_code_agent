@@ -2,9 +2,33 @@
 
 import json
 import time
-from typing import Optional, Any, Callable
-from .base import Tool
+import logging
+import os
+import hashlib
+from typing import Optional, Any, Callable, TypedDict
+
+from .base import Tool, ToolStatus, ErrorCode, ToolParameter
+from .circuit_breaker import CircuitBreaker
+from core.env import load_env
 from core.session_logger import SessionLogger, _NoopLogger
+
+load_env()
+
+# 设置日志
+logger = logging.getLogger(__name__)
+
+
+def _hash_json(data: Any) -> str:
+    payload = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class ReadMeta(TypedDict):
+    """Read 操作的元信息（用于乐观锁自动注入）"""
+    path_resolved: str        # 解析后的规范化路径（主键）
+    file_mtime_ms: int        # 文件修改时间（毫秒）
+    file_size_bytes: int      # 文件大小（字节）
+    captured_at: float        # 缓存时间戳（用于调试/过期策略）
 
 class ToolRegistry:
     """
@@ -20,6 +44,13 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
         self._functions: dict[str, dict[str, Any]] = {}
         self._log = session_logger or _NoopLogger()
+        # Read 元信息缓存（用于乐观锁自动注入）
+        # key: path_resolved 或原始 path
+        self._read_cache: dict[str, ReadMeta] = {}
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=int(os.getenv("CIRCUIT_FAILURE_THRESHOLD", "3")),
+            recovery_timeout=int(os.getenv("CIRCUIT_RECOVERY_TIMEOUT", "300")),
+        )
 
     def register_tool(self, tool: Tool):
         """
@@ -63,6 +94,110 @@ class ToolRegistry:
         else:
             self._log.console(f"⚠️ 工具 '{name}' 不存在。")
 
+    def get_openai_tools(self) -> list[dict[str, Any]]:
+        """
+        构建 OpenAI function calling 所需的 tools 列表。
+
+        Returns:
+            list of {"type": "function", "function": {name, description, parameters}}
+        """
+        tools: list[dict[str, Any]] = []
+
+        for tool in sorted(self._tools.values(), key=lambda item: item.name):
+            if not self._circuit_breaker.is_available(tool.name):
+                continue
+            try:
+                params = tool.get_parameters()
+            except Exception:
+                params = []
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": self._parameters_to_schema(params),
+                },
+            })
+
+        for name, info in sorted(self._functions.items(), key=lambda item: item[0]):
+            if not self._circuit_breaker.is_available(name):
+                continue
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": info.get("description", "") if isinstance(info, dict) else "",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "raw input string",
+                            }
+                        },
+                        "required": ["input"],
+                        "additionalProperties": False,
+                    },
+                },
+            })
+
+        return tools
+
+    def get_openai_tools_fingerprint(self) -> str:
+        return _hash_json(self.get_openai_tools())
+
+    @staticmethod
+    def _parameters_to_schema(params: list[ToolParameter]) -> dict[str, Any]:
+        """
+        将 ToolParameter 列表转换为 JSON Schema。
+        """
+        if not isinstance(params, (list, tuple)):
+            params = []
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for p in params or []:
+            param_type = (p.type or "string").strip().lower()
+            schema: dict[str, Any] = {
+                "type": ToolRegistry._normalize_schema_type(param_type),
+                "description": p.description or "",
+            }
+            if schema["type"] == "array":
+                # OpenAI-compatible function schemas expect an `items` schema for arrays.
+                schema.setdefault("items", {"type": "string"})
+            if p.default is not None:
+                schema["default"] = p.default
+            properties[p.name] = schema
+            if p.required:
+                required.append(p.name)
+
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    @staticmethod
+    def _normalize_schema_type(param_type: str) -> str:
+        """
+        规范化参数类型到 JSON Schema 类型。
+        """
+        mapping = {
+            "str": "string",
+            "string": "string",
+            "int": "integer",
+            "integer": "integer",
+            "float": "number",
+            "number": "number",
+            "bool": "boolean",
+            "boolean": "boolean",
+            "array": "array",
+            "list": "array",
+            "object": "object",
+            "dict": "object",
+        }
+        return mapping.get(param_type, "string")
+
     def get_tool(self, name: str) -> Optional[Tool]:
         """获取Tool对象"""
         return self._tools.get(name)
@@ -72,160 +207,330 @@ class ToolRegistry:
         func_info = self._functions.get(name)
         return func_info["func"] if func_info else None
 
-    def execute_tool(self, name: str, input_text: str) -> str:
+    def prepare_parameters(self, input_text: Any) -> dict[str, Any]:
+        """Normalize raw tool input into a dict payload."""
+        if isinstance(input_text, dict):
+            return input_text.copy()
+        return {"input": input_text}
+
+    def is_available(self, name: str) -> bool:
+        """Whether a tool/function is currently executable."""
+        return self._circuit_breaker.is_available(name)
+
+    def create_circuit_open_response(self, name: str, parameters: dict[str, Any]) -> str:
+        payload = {
+            "status": ToolStatus.ERROR.value,
+            "data": {},
+            "text": f"工具 '{name}' 因连续失败被临时禁用。",
+            "error": {
+                "code": ErrorCode.CIRCUIT_OPEN.value,
+                "message": f"工具 '{name}' 因连续失败被临时禁用。",
+            },
+            "stats": {"time_ms": 0},
+            "context": {"cwd": ".", "params_input": parameters},
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def record_execution_result(self, name: str, result_payload: Optional[dict]) -> None:
+        """Update execution health after a tool run."""
+        if not isinstance(result_payload, dict):
+            return
+        status = result_payload.get("status")
+        if status == ToolStatus.ERROR.value:
+            err = result_payload.get("error", {}) or {}
+            err_msg = err.get("message") if isinstance(err, dict) else None
+            self._circuit_breaker.record_failure(name, str(err_msg or result_payload.get("text") or ""))
+        else:
+            self._circuit_breaker.record_success(name)
+
+    def cache_read_result(self, result: Any, params_input: dict) -> None:
+        """Persist optimistic-lock metadata from Read outputs."""
+        self._cache_read_meta(result, params_input)
+
+    def inject_optimistic_lock_params(self, tool_name: str, parameters: dict) -> dict:
+        """Inject optimistic-lock parameters for write-like tools when available."""
+        return self._inject_optimistic_lock_params(tool_name, parameters)
+
+    def normalize_result(self, tool_name: str, result: Any, params_input: Any) -> dict:
+        """Normalize a raw tool return value to the common tool response protocol."""
+        return self._normalize_result(tool_name, result, params_input)
+
+    def create_internal_error_payload(self, name: str, message: str, params_input: dict) -> dict:
+        """Create a common internal-error payload."""
+        return self._create_internal_error_payload(name, message, params_input)
+
+    def execute_tool(self, name: str, input_text) -> str:
         """
         执行工具
 
-        Args：
-            name：工具名称
-            input_text：输入参数
+        Args:
+            name: 工具名称
+            input_text: 输入参数
 
-        Returns：
-            工具执行结果
+        Returns:
+            工具执行结果（符合《通用工具响应协议》的 JSON 字符串）
         """
-        t0 = time.time()
-        success = True
-        result = ""
+        from .executor import ToolExecutor
 
-        try:
-            # 优先查找Tool对象
-            if name in self._tools:
-                tool = self._tools[name]
-                raw = (input_text or "").strip()
+        return ToolExecutor(self).execute(name, input_text)
 
-                # 预处理：如果输入包含换行和另一个Action，只取第一行
-                if '\n' in raw and 'Action:' in raw:
-                    lines = raw.split('\n')
-                    raw = lines[0].strip()
+    def export_read_cache(self) -> dict[str, ReadMeta]:
+        """导出 Read 缓存（用于会话持久）。"""
+        return dict(self._read_cache)
 
-                # 1) JSON直通：允许ReAct里用tool[{"k":"v"}]精确传参
-                def _try_json(txt: str):
-                    try:
-                        return json.loads(txt)
-                    except Exception:
-                        return None
+    def import_read_cache(self, data: dict[str, ReadMeta]) -> None:
+        """恢复 Read 缓存（用于会话持久）。"""
+        if isinstance(data, dict):
+            self._read_cache = dict(data)
 
-                obj = None
+    def _inject_optimistic_lock_params(self, tool_name: str, parameters: dict) -> dict:
+        """
+        为 Write/Edit 工具自动注入乐观锁参数
 
-                # 1a 单个对象
-                if raw.startswith("{") and raw.endswith("}"):
-                    obj = _try_json(raw)
-                # 1b 常见模型输出尾部多了一个']'容错
-                if obj is None and raw.startswith("{") and raw.endswith("}]"):
-                    obj = _try_json(raw[:-1].strip())
-                # 1c模型输出为数组包裹一个对象
-                if obj is None and raw.startswith("[") and raw.endswith("]"):
-                    arr = _try_json(raw)
-                    if isinstance(arr, list) and len(arr) == 1 and isinstance(arr[0], dict):
-                        obj = arr[0]
-                # 1d错位尾括号（常见：{"a":1,"b":2}])
-                if obj is None and raw.endswith("}]") and raw.count("{") == 1 and raw.count("}") == 2:
-                    obj = _try_json(raw[:-1])
-                # 1e正则兜底，提取首个完整JSON对象
-                if obj is None and "{" in raw and "}" in raw:
-                    try:
-                        import re
-                        # 使用括号匹配而非简单正则
-                        def extract_first_json_object(text: str):
-                            """从文本中提取第一个完整的JSON对象"""
-                            start = text.find('{')
-                            if start == -1:
-                                return None
-                            depth = 0
-                            in_string = False
-                            escape = False
-                            for i, c in enumerate(text[start:], start):
-                                if escape:
-                                    escape = False
-                                    continue
-                                if c == '\\' and in_string:
-                                    escape = True
-                                    continue
-                                if c == '"' and not escape:
-                                    in_string = not in_string
-                                    continue
-                                if in_string:
-                                    continue
-                                if c == '{':
-                                    depth += 1
-                                elif c == '}':
-                                    depth -= 1
-                                    if depth == 0:
-                                        return text[start:i + 1]
-                            return None
+        如果参数中缺少 expected_mtime_ms / expected_size_bytes，
+        尝试从 Read 缓存中查找并注入。
 
-                        json_str = extract_first_json_object(raw)
-                        if json_str:
-                            obj = json.loads(json_str)
-                    except Exception:
-                        pass
+        Args:
+            tool_name: 工具名称
+            parameters: 原始参数
 
-                if isinstance(obj, dict):
-                    result = tool.run(obj)
-                else:
-                    # 2）单参数兜底：如果工具只有一个必填参数，把input_text映射到该参数名
-                    params = tool.get_parameters()
-                    required = [p for p in params if p.required]
-                    if len(required) == 1:
-                        result = tool.run({required[0].name: input_text})
-                    # 3)兼容旧行为：若存在input参数，使用input
-                    elif any(p.name == "input" for p in params):
-                        result = tool.run({"input": input_text})
-                    else:
-                        result = (
-                            f"错误：工具 '{name}' 需要结构化参数。"
-                            "请使用 JSON 形式传参，例如：tool[{\"param\":\"value\"}]"
-                        )
+        Returns:
+            注入后的参数（可能与原始相同）
+        """
+        # 如果已经提供了，不覆盖
+        if "expected_mtime_ms" in parameters and "expected_size_bytes" in parameters:
+            return parameters
 
-            # 查找函数工具
-            elif name in self._functions:
-                func = self._functions[name]["func"]
-                result = func(input_text)
+        # 获取目标路径
+        path = parameters.get("path")
+        if not path:
+            return parameters
+
+        # 尝试从缓存查找（先用原始 path，再用规范化 path）
+        meta = self._read_cache.get(path)
+        if not meta:
+            # 尝试规范化路径匹配
+            # 注意：这里的规范化逻辑应与工具内部一致
+            normalized_path = path.replace("\\", "/")
+            if normalized_path.startswith("./"):
+                normalized_path = normalized_path[2:]
+            meta = self._read_cache.get(normalized_path)
+
+        if meta:
+            # 找到缓存，注入参数
+            if "expected_mtime_ms" not in parameters:
+                parameters["expected_mtime_ms"] = meta["file_mtime_ms"]
+            if "expected_size_bytes" not in parameters:
+                parameters["expected_size_bytes"] = meta["file_size_bytes"]
+            logger.debug(
+                f"[OptimisticLock] Auto-injected for {tool_name}: "
+                f"mtime={meta['file_mtime_ms']}, size={meta['file_size_bytes']}, path={path}"
+            )
+        else:
+            # 未找到缓存，让工具正常报错（提示先 Read）
+            logger.debug(
+                f"[OptimisticLock] No Read cache found for path '{path}'. "
+                f"Tool will report INVALID_PARAM if file exists."
+            )
+
+        return parameters
+
+    def _cache_read_meta(self, result: Any, params_input: dict) -> None:
+        """
+        缓存 Read 工具的元信息（用于后续 Write/Edit 的乐观锁校验）
+
+        仅在 Read 成功或 partial 时缓存。
+
+        Args:
+            result_str: Read 工具的响应字符串
+            params_input: 原始输入参数
+        """
+        if isinstance(result, dict):
+            parsed = result
+        else:
+            try:
+                parsed = json.loads(result)
+            except json.JSONDecodeError:
+                return
+
+        # 仅缓存成功/partial 状态
+        status = parsed.get("status")
+        if status not in ("success", "partial"):
+            return
+
+        # 提取元信息
+        stats = parsed.get("stats", {})
+        context = parsed.get("context", {})
+
+        file_mtime_ms = stats.get("file_mtime_ms")
+        file_size_bytes = stats.get("file_size_bytes")
+        path_resolved = context.get("path_resolved")
+
+        # 必须同时有 mtime 和 size
+        if file_mtime_ms is None or file_size_bytes is None:
+            logger.warning(
+                f"[OptimisticLock] Read response missing file_mtime_ms or file_size_bytes. "
+                f"Skipping cache."
+            )
+            return
+
+        # 构建缓存条目
+        meta: ReadMeta = {
+            "path_resolved": path_resolved or "",
+            "file_mtime_ms": file_mtime_ms,
+            "file_size_bytes": file_size_bytes,
+            "captured_at": time.time(),
+        }
+
+        # 使用 path_resolved 作为主键
+        if path_resolved:
+            self._read_cache[path_resolved] = meta
+
+        # 同时用原始 path 作为别名键（便于匹配）
+        original_path = params_input.get("path")
+        if original_path and original_path != path_resolved:
+            self._read_cache[original_path] = meta
+
+        logger.debug(
+            f"[OptimisticLock] Cached Read meta: path={path_resolved}, "
+            f"mtime={file_mtime_ms}, size={file_size_bytes}"
+        )
+
+    def clear_read_cache(self) -> None:
+        """
+        清空 Read 元信息缓存
+
+        在需要重置乐观锁状态时调用（如新会话开始）。
+        """
+        self._read_cache.clear()
+        logger.debug("[OptimisticLock] Read cache cleared.")
+
+    def _normalize_result(self, tool_name: str, result: Any, params_input: Any) -> dict:
+        if isinstance(result, dict):
+            payload = result
+        elif isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except json.JSONDecodeError:
+                return self._create_internal_error_payload(
+                    name=tool_name,
+                    message=f"Tool '{tool_name}' returned invalid JSON.",
+                    params_input=params_input if isinstance(params_input, dict) else {"input": params_input},
+                )
+        else:
+            return self._create_internal_error_payload(
+                name=tool_name,
+                message=f"Tool '{tool_name}' returned unsupported result type.",
+                params_input=params_input if isinstance(params_input, dict) else {"input": params_input},
+            )
+
+        if not isinstance(payload, dict):
+            return self._create_internal_error_payload(
+                name=tool_name,
+                message=f"Tool '{tool_name}' returned invalid payload.",
+                params_input=params_input if isinstance(params_input, dict) else {"input": params_input},
+            )
+
+        status = payload.get("status")
+        if status not in (ToolStatus.SUCCESS.value, ToolStatus.PARTIAL.value, ToolStatus.ERROR.value):
+            return self._create_internal_error_payload(
+                name=tool_name,
+                message=f"Tool '{tool_name}' returned non-protocol response.",
+                params_input=params_input if isinstance(params_input, dict) else {"input": params_input},
+            )
+
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = {}
+
+        text = payload.get("text") or ""
+        if not isinstance(text, str):
+            text = str(text)
+
+        stats = payload.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+        stats.setdefault("time_ms", 0)
+
+        context = payload.get("context")
+        if not isinstance(context, dict):
+            context = {}
+        context.setdefault("cwd", ".")
+        if "params_input" not in context:
+            context["params_input"] = (
+                params_input if isinstance(params_input, dict) else {"input": params_input}
+            )
+
+        normalized = {
+            "status": status,
+            "data": data,
+            "text": text,
+            "stats": stats,
+            "context": context,
+        }
+
+        if status == ToolStatus.ERROR.value:
+            error = payload.get("error")
+            if not isinstance(error, dict):
+                error = {
+                    "code": ErrorCode.INTERNAL_ERROR.value,
+                    "message": text or "Tool execution error",
+                }
             else:
-                result = f"错误：未找到名为 '{name}' 的工具。"
-                success = False
+                error.setdefault("code", ErrorCode.INTERNAL_ERROR.value)
+                error.setdefault("message", text or "Tool execution error")
+            normalized["error"] = error
 
-        except Exception as e:
-            result = f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
-            success = False
+        return normalized
 
-        latency_ms = int((time.time() - t0) * 1000)
-        output_str = str(result)
-        self._log.event("tool_call", {
-            "tool_name": name,
-            "tool_input": (input_text or "")[:2000],
-            "tool_output": output_str[:4000],
-            "output_length": len(output_str),
-            "latency_ms": latency_ms,
-            "success": success,
-        })
-        if not success:
-            self._log.inc_error()
+    def _create_internal_error_payload(self, name: str, message: str, params_input: dict) -> dict:
+        """创建内部错误响应 payload（符合协议）"""
+        return {
+            "status": ToolStatus.ERROR.value,
+            "data": {},
+            "text": message,
+            "error": {
+                "code": ErrorCode.INTERNAL_ERROR.value,
+                "message": message,
+            },
+            "stats": {"time_ms": 0},
+            "context": {
+                "cwd": ".",
+                "params_input": params_input,
+            },
+        }
 
-        return result
+    def _create_internal_error_response(self, name: str, message: str, params_input: dict) -> str:
+        """创建内部错误响应（符合协议）"""
+        payload = self._create_internal_error_payload(name, message, params_input)
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def get_tools_description(self) -> str:
         """
         获取所有可用工具的格式化描述字符串
 
-        Returns：
+        Returns:
             工具描述字符串，用于构建提示词
         """
         descriptions = []
 
         # Tool对象描述
         for tool in self._tools.values():
-            descriptions.append(f"-{tool.name}:{tool.description}")
+            descriptions.append(f"- {tool.name}: {tool.description}")
 
         # 函数工具描述
         for name, info in self._functions.items():
-            descriptions.append(f"-{name}:{info['description']}")
+            descriptions.append(f"- {name}: {info['description']}")
 
         return "\n".join(descriptions) if descriptions else "暂无可用工具"
 
     def list_tools(self) -> list[str]:
         """列出所有工具名称"""
         return list(self._tools.keys()) + list(self._functions.keys())
+
+    def get_disabled_tools(self) -> list[str]:
+        """获取当前被熔断禁用的工具列表。"""
+        return self._circuit_breaker.get_disabled_tools()
 
     def get_all_tools(self) -> list[Tool]:
         """获取所有Tool对象"""
@@ -236,7 +541,6 @@ class ToolRegistry:
         self._tools.clear()
         self._functions.clear()
         self._log.console("🧹 所有工具已清空。")
-
 
 # 全局工具注册表
 global_registry = ToolRegistry()

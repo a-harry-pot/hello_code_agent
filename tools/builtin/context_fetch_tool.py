@@ -83,8 +83,9 @@ class ContextFetchTool(Tool):
             ),
         ]
 
-    def run(self,parameters:Dict[str, Any]) -> str:
+    def run(self,params_input:Dict[str, Any]) -> str:
         """执行上下文获取"""
+        parameters = dict(params_input)
         sources = parameters.get("sources",[])
         query = parameters.get("query","")
         paths = parameters.get("paths","")

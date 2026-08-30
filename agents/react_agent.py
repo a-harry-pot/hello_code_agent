@@ -171,17 +171,22 @@ class ReActAgent(Agent):
             self._log.inc_step()
             self._log.console(c(f"\n--- Step {current_step}/{self.max_steps} ---", ACCENT))
 
-            # 构建提示词
+            # 构建提示词：system 放格式约束+工具描述，user 放任务+历史
             tools_desc = self.tool_registry.get_tools_description()
             history_str = "\n".join(self.current_history)
-            prompt = self.prompt_template.format(
+            user_prompt="user_query: "+input_text+"\nhistory: "+history_str
+            # system 消息 = react.md 模板（格式约束 + 工具说明），不放执行历史
+            system_prompt = self.prompt_template.format(
                 tools=tools_desc,
                 question=input_text,
-                history=history_str
+                history=""  # system 中不放历史，确保格式约束不被稀释
             )
 
-            # 调用LLM
-            messages = [{"role": "user", "content": prompt}]
+            # user 消息 = 原始输入（已含对话历史/工具摘要）
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
             spinner = Spinner("Thinking…")
             spinner.start()
             response_text = self.llm.invoke(messages, **kwargs)
@@ -209,23 +214,27 @@ class ReActAgent(Agent):
                 })
 
             if not action:
-                # One forced retry: ask model to rewrite in strict format
+                # 强制格式修复：使用与主 prompt 一致的约定
                 try:
                     repair_sys = (
-                        "You MUST output exactly two lines:\n"
-                        "Thought: ...\n"
-                        "Action: tool_name[tool_input] OR Finish[final answer]\n"
-                        "No extra text. No markdown headers."
+                        "你是一个 ReAct Agent。你的每次回复必须严格包含两行，缺一不可：\n"
+                        "Thought: <你的思考>\n"
+                        "Action: tool_name[参数] 或 Finish[最终答案]\n"
+                        "不要输出任何其他内容。不要用 markdown 标题或代码块。"
                     )
-                    repair_user = f"Rewrite the following into the required two-line format:\n\n{response_text}"
+                    repair_user = f"请将以下内容严格按照上述两行格式重写：\n\n{response_text[-2000:]}"
                     spinner = Spinner("Repairing format…")
                     spinner.start()
                     repaired = self.llm.invoke(
-                        [{"role": "system", "content": repair_sys}, {"role": "user", "content": repair_user}],
-                        max_tokens=200,
+                        [
+                            {"role": "system", "content": repair_sys},
+                            {"role": "user", "content": repair_user},
+                        ],
+                        max_tokens=300,
                     )
                     spinner.stop()
-                    thought, action = self._parse_output(repaired or "")
+                    if repaired:
+                        thought, action = self._parse_output(repaired)
                 except Exception:
                     pass
 
